@@ -634,8 +634,9 @@ def same_vehicle(a, b):
 class VehicleTracker:
     """Ghép cặp xe giữa khung t và t+1 bằng khoảng cách tâm + thuật toán Hungarian."""
 
-    def __init__(self, max_dist, max_missed=8):
+    def __init__(self, max_dist, max_missed=8, diag=1000.0):
         self.max_dist = max_dist
+        self.diag = diag
         self.max_missed = max_missed
         self.next_id = 1
         self.tracks = {}
@@ -652,10 +653,20 @@ class VehicleTracker:
             # so với vị trí DỰ ĐOÁN (vị trí cũ + vận tốc × số khung bị mất dấu) để không mất dấu xe chạy nhanh
             pred = {i: self.tracks[i]["c"] + self.tracks[i]["v"] * (1 + self.tracks[i]["missed"]) for i in ids}
             cost = np.array([[np.linalg.norm(pred[i] - c) for c in cents] for i in ids])
+            BIG = 1e9
+            for r, i in enumerate(ids):
+                tb = self.tracks[i]["box"]
+                # xe chỉ đi được một đoạn cỡ thân xe giữa hai khung xét ⇒ cổng tỉ lệ với kích thước xe
+                gate = min(self.max_dist, max(0.8 * max(tb[2], tb[3]), 0.04 * self.diag)) * (
+                    1 + 0.5 * min(self.tracks[i]["missed"], 3))
+                for c, b in enumerate(boxes):
+                    ratio = (b[2] * b[3]) / max(1.0, tb[2] * tb[3])
+                    if cost[r, c] > gate or not (0.3 <= ratio <= 3.3):
+                        cost[r, c] = BIG  # không cho ghép: quá xa hoặc kích thước khác hẳn (xe khác)
             rows, cols = linear_sum_assignment(cost)
             for r, c in zip(rows, cols):
                 t = self.tracks[ids[r]]
-                if cost[r, c] <= self.max_dist * (1 + 0.3 * t["missed"]):
+                if cost[r, c] < BIG:
                     step_v = (cents[c] - t["c"]) / (1 + t["missed"])
                     t["v"] = 0.6 * t["v"] + 0.4 * step_v if t["age"] > 1 else step_v
                     t.update(box=boxes[c], c=cents[c], missed=0, age=t["age"] + 1)
@@ -738,6 +749,7 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
     single_image = background is not None and total == 1
     warmup = 0 if background is not None else max(5, int(fps_eff * 0.8))
     margin = 3.0
+    cross_m = None  # ngưỡng trễ (hysteresis) quanh vạch, tính theo chiều cao khung hình
 
     for i, (t_sec, frame) in enumerate(frames):
         if line is None:
@@ -749,7 +761,7 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
             max_area = cfg.get("max_area_pct", 20) / 100 * frame_area
             diag = float(np.hypot(W, H))
             max_dist = (0.35 if background is not None else 0.12 * max(1, cfg["frame_step"]) ** 0.5) * diag
-            tracker = VehicleTracker(max_dist=min(max_dist, 0.4 * diag), max_missed=max(8, int(1.5 * fps_eff)))
+            tracker = VehicleTracker(max_dist=min(max_dist, 0.4 * diag), max_missed=max(8, int(1.5 * fps_eff)), diag=diag)
             if background is None:
                 detector = VideoVehicleDetector(cfg["sensitivity"])
 
@@ -783,6 +795,7 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
                 head = line.ref_point(tr["box"])
                 tail = (x_ + w_ / 2, y_)
                 tr["first_db"] = line.dist_before(head)
+                tr["box0"], tr["t0"] = tr["box"], t_sec
                 tr["first_tail_db"] = line.dist_before(tail)
                 # mảnh mới sinh ra đè lên một xe đã được xét ⇒ thừa hưởng kết quả, không tính lại
                 for other_id, other in active.items():
@@ -791,6 +804,7 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
                         break
 
         new_viol = []
+        replace_evidence = []  # (chỉ số bản ghi, id xe) — thay ảnh bằng chứng bằng khung xe đầy đủ hơn
         for tid, tr in active.items():
             ref = line.ref_point(tr["box"])
             if not line.within(ref):
@@ -801,31 +815,63 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
                     tr["violation"] = True
                     new_viol.append(tid)
                 continue
-            if db > margin:
+            if cross_m is None:
+                cross_m = max(margin, 0.015 * H)
+            tr["max_db"] = max(tr.get("max_db", db), db)
+            if db > cross_m:
                 tr["seen_before"] = True
             # Xe đã từng ở trước vạch, HOẶC lúc mới xuất hiện thân xe đang nằm vắt qua vạch
             # (xe có sẵn từ đầu cảnh / đi vào từ mép khung hình ngay sát vạch)
             straddled = tr.get("first_tail_db", -1) > margin and tr.get("first_db", 0) < margin
-            progressed = tr.get("first_db", db) - db > 0.04 * H  # thực sự đã chạy qua, không đứng yên
-            if db < -margin and not tr["done"] and tr["age"] >= 2 and (
-                    tr["seen_before"] or (straddled and progressed)):
+            # phải thực sự chạy qua vạch một đoạn, không phải khung xe "rung" qua lại quanh vạch khi xe đứng yên
+            progressed = tr["max_db"] - db > 0.05 * H
+            bx_, by_, bw_, bh_ = tr["box"]
+            # mảnh vụn (bóng, kính, mép xe) thường dẹt hoặc rất nhỏ ⇒ không đủ tư cách là "một xe"
+            vehicle_like = (bw_ * bh_ >= 1.5 * min_area and 0.3 <= bw_ / max(bh_, 1) <= 2.4
+                            and bh_ >= 0.035 * H)
+            if db < -cross_m and not tr["done"] and tr["age"] >= 3 and vehicle_like and progressed and (
+                    tr["seen_before"] or straddled):
                 tr["done"] = True
+                tr["t_cross"] = t_sec
                 recent = results.setdefault("_recent", [])
-                dup = any(oid != tid and o["done"] and same_vehicle(tr["box"], o["box"]) for oid, o in active.items())
+                def _inside(p, q):  # tâm khung p nằm trong khung q
+                    cx__, cy__ = p[0] + p[2] / 2, p[1] + p[3] / 2
+                    return q[0] <= cx__ <= q[0] + q[2] and q[1] <= cy__ <= q[1] + q[3]
+                # trùng với một xe VỪA qua vạch (≤ 4 s) mà khung mới nằm trong / đè lên khung xe đó
+                dup_of = next((o for oid, o in active.items()
+                               if oid != tid and o["done"] and t_sec - o.get("t_cross", -99) <= 4.0
+                               and (box_iou(tr["box"], o["box"]) > 0.3 or _inside(tr["box"], o["box"]))), None)
+                dup = dup_of is not None
                 cx_, cy_ = tr["c"]
                 for t0, o in recent:  # o = xe đã qua vạch trước đó (giữ vị trí cuối cùng nhìn thấy)
                     dt = t_sec - o.get("t_last", t0)
+                    # xe mới "mọc ra" đúng chỗ xe cũ vừa mất dấu ⇒ vẫn là chiếc xe đó (bị mất dấu rồi nhận lại)
+                    born = tr.get("t0", t_sec)
+                    if (o.get("t_last", t0) - 0.5 <= born <= o.get("t_last", t0) + 6.0
+                            and box_iou(tr.get("box0", tr["box"]), o["box"]) > 0.3):
+                        dup, dup_of = True, o
+                        break
                     if t_sec - t0 > 4.0:
                         continue
-                    reach = 0.8 * max(o["box"][2], o["box"][3], tr["box"][2], tr["box"][3]) + 0.12 * H * max(dt, 0) + 0.04 * H
-                    if same_vehicle(tr["box"], o["box"]) or np.hypot(cx_ - o["c"][0], cy_ - o["c"][1]) <= reach:
-                        dup = True
+                    reach = 0.8 * max(o["box"][2], o["box"][3]) + 0.12 * H * min(max(dt, 0), 2.0) + 0.04 * H
+                    if (box_iou(tr["box"], o["box"]) > 0.3 or _inside(tr["box"], o["box"])
+                            or np.hypot(cx_ - o["c"][0], cy_ - o["c"][1]) <= reach):
+                        dup, dup_of = True, o
                         break
+                if dup and state == "RED" and dup_of is not None and dup_of.get("viol_idx") is not None:
+                    # bản ghi trước có thể là mảnh vụn của xe ⇒ nếu khung mới to hơn hẳn thì thay ảnh bằng chứng
+                    if tr["box"][2] * tr["box"][3] > 1.5 * dup_of["viol_area"]:
+                        replace_evidence.append((dup_of["viol_idx"], tid))
+                        dup_of["viol_area"] = tr["box"][2] * tr["box"][3]
                 recent.append((t_sec, tr))
                 if state == "RED":
                     tr["violation"] = True
                     if not dup:  # mảnh khác của cùng một xe vừa được ghi ⇒ không ghi thêm
                         new_viol.append(tid)
+                        tr["viol_idx"] = len(results["violations"]) + len(new_viol) - 1
+                        tr["viol_area"] = tr["box"][2] * tr["box"][3]
+                    elif dup_of is not None:
+                        tr["viol_idx"], tr["viol_area"] = dup_of.get("viol_idx"), dup_of.get("viol_area", 0)
                 elif not dup:
                     results["crossed_ok"] += 1
 
@@ -864,6 +910,12 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
                 "snapshot": encode_jpg(out),
                 "crop": encode_jpg(crop_box(frame, b)),
             })
+        for idx, tid in replace_evidence:
+            if 0 <= idx < len(results["violations"]) and tid in active:
+                b = active[tid]["box"]
+                results["violations"][idx].update(
+                    MaXe=f"ID-{tid:03d}", LoaiXe=vehicle_type(b, frame_area, cfg["car_area_pct"]) + " (ước lượng)",
+                    snapshot=encode_jpg(out), crop=encode_jpg(crop_box(frame, b)))
 
         if writer is not None:
             writer(out)

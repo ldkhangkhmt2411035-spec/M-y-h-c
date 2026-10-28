@@ -1,0 +1,8 @@
+streamlit>=1.30.0
+opencv-python-headless
+numpy
+pandas
+pillow
+plotly
+scikit-image
+scikit-learn

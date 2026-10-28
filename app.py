@@ -7,58 +7,210 @@ import cv2
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from scipy.optimize import linear_sum_assignment
 from skimage.feature import hog
 
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+SAMPLE_VIDEO = os.path.join(APP_DIR, "video_thu.mp4")
+
 # ==========================================
-# CẤU HÌNH TRANG STREAMLIT & MODERN CSS
+# CẤU HÌNH TRANG & GIAO DIỆN
 # ==========================================
 st.set_page_config(
-    page_title="Hệ thống Cảnh báo Xe Vượt Đèn Đỏ (Traditional ML)",
+    page_title="Giám sát vượt đèn đỏ · Nhóm 6",
     page_icon="🚦",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 
+# Bảng màu: nền xanh than tối như phòng điều hành giao thông,
+# ba màu tín hiệu (đỏ / vàng / xanh) chỉ dùng khi mang đúng ý nghĩa.
+C_BG, C_PANEL, C_PANEL2, C_LINE = "#0B1220", "#111A2E", "#0E1628", "#1F2A44"
+C_TEXT, C_MUTED, C_DIM = "#E2E8F0", "#94A3B8", "#64748B"
+C_ACCENT = "#38BDF8"
+C_RED, C_AMBER, C_GREEN = "#EF4444", "#F59E0B", "#22C55E"
+
 st.markdown("""
-    <style>
-    .stApp { background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%); color: #f8fafc; }
-    .main-header {
-        background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px);
-        border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 16px;
-        padding: 20px; margin-bottom: 20px; box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
-    }
-    .metric-card {
-        background: rgba(30, 41, 59, 0.6); border-radius: 12px; padding: 16px;
-        border-left: 4px solid #3b82f6; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-    }
-    .model-info-box {
-        background: rgba(15, 23, 42, 0.8); border: 1px solid #3b82f6;
-        border-radius: 10px; padding: 12px; margin-top: 10px;
-    }
-    .badge-red, .badge-green, .badge-yellow, .badge-gray {
-        color: white; padding: 6px 14px; border-radius: 20px; font-weight: bold; font-size: 14px;
-    }
-    .badge-red { background-color: #ef4444; box-shadow: 0 0 12px rgba(239, 68, 68, 0.5); }
-    .badge-green { background-color: #10b981; box-shadow: 0 0 12px rgba(16, 185, 129, 0.5); }
-    .badge-yellow { background-color: #f59e0b; }
-    .badge-gray { background-color: #64748b; }
-    .alert-violation {
-        background: linear-gradient(90deg, #7f1d1d 0%, #991b1b 100%); border: 2px solid #ef4444;
-        color: #fecaca; padding: 15px; border-radius: 12px; font-size: 16px; font-weight: bold; margin-top: 15px;
-    }
-    .pipeline-box {
-        background: rgba(15, 23, 42, 0.6); border: 1px dashed #475569; border-radius: 10px;
-        padding: 10px 14px; font-size: 0.92rem; color: #cbd5e1;
-    }
-    </style>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap');
+
+/* ---------- Nền & chữ (dự phòng nếu thiếu .streamlit/config.toml) ---------- */
+.stApp {
+    background:
+        radial-gradient(1200px 500px at 85% -10%, rgba(56,189,248,0.08), transparent 60%),
+        radial-gradient(900px 400px at -10% 10%, rgba(239,68,68,0.06), transparent 60%),
+        #0B1220;
+    color: #E2E8F0;
+    font-family: 'Be Vietnam Pro', system-ui, sans-serif;
+}
+.stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp p, .stApp li, .stApp label,
+.stApp button, .stApp input, .stApp textarea { font-family: 'Be Vietnam Pro', system-ui, sans-serif; }
+[data-testid="stWidgetLabel"] p, [data-testid="stWidgetLabel"] label { color: #CBD5E1 !important; font-weight: 500; }
+[data-testid="stMarkdownContainer"] p, [data-testid="stCaptionContainer"] { color: inherit; }
+[data-testid="stCaptionContainer"], .stCaption { color: #94A3B8 !important; }
+[data-testid="stHeader"] { background: transparent; }
+.block-container { padding-top: 2.2rem; padding-bottom: 3rem; max-width: 1340px; }
+
+/* ---------- Sidebar ---------- */
+[data-testid="stSidebar"] { background: #0E1628; border-right: 1px solid #1F2A44; }
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p { font-size: 0.86rem; }
+
+/* ---------- Tabs ---------- */
+.stTabs [data-baseweb="tab-list"] { gap: 6px; border-bottom: 1px solid #1F2A44; }
+.stTabs [data-baseweb="tab"] {
+    height: 44px; padding: 0 16px; border-radius: 10px 10px 0 0;
+    color: #94A3B8; font-weight: 600; background: transparent;
+}
+.stTabs [data-baseweb="tab"]:hover { color: #E2E8F0; background: rgba(148,163,184,0.06); }
+.stTabs [aria-selected="true"] { color: #E2E8F0 !important; background: #111A2E; }
+.stTabs [data-baseweb="tab-highlight"] { background: #38BDF8; height: 2px; }
+.stTabs [data-baseweb="tab-border"] { display: none; }
+
+/* ---------- Khung có viền (st.container(border=True)) ---------- */
+[data-testid="stVerticalBlockBorderWrapper"], div[data-testid="stVerticalBlock"][style*="border"] {
+    background: #111A2E; border-color: #1F2A44 !important; border-radius: 14px;
+}
+
+/* ---------- Nút ---------- */
+.stButton > button, .stDownloadButton > button {
+    border-radius: 10px; font-weight: 600; border: 1px solid #2A3A5C;
+    background: #16213A; color: #E2E8F0; transition: all .15s ease;
+}
+.stButton > button:hover, .stDownloadButton > button:hover { border-color: #38BDF8; color: #fff; }
+.stButton > button[kind="primary"] {
+    background: linear-gradient(180deg, #38BDF8, #0EA5E9); color: #04121F; border: none;
+    box-shadow: 0 6px 20px rgba(14,165,233,0.25); font-weight: 700;
+}
+.stButton > button[kind="primary"]:hover { filter: brightness(1.08); color: #04121F; }
+
+/* ---------- Ô tải file ---------- */
+[data-testid="stFileUploaderDropzone"] {
+    background: #0E1628; border: 1.5px dashed #2A3A5C; border-radius: 12px;
+}
+[data-testid="stFileUploaderDropzone"]:hover { border-color: #38BDF8; }
+
+/* ---------- Expander ---------- */
+[data-testid="stExpander"] details { background: #0E1628; border: 1px solid #1F2A44; border-radius: 12px; }
+
+/* ---------- Ảnh ---------- */
+[data-testid="stImage"] img { border-radius: 10px; }
+[data-testid="stImageCaption"], [data-testid="caption"] { color: #94A3B8 !important; }
+
+/* ---------- Thành phần tự dựng ---------- */
+.hero {
+    display: flex; align-items: center; justify-content: space-between; gap: 24px; flex-wrap: wrap;
+    padding: 22px 26px; border: 1px solid #1F2A44; border-radius: 18px;
+    background: linear-gradient(135deg, rgba(17,26,46,0.95), rgba(14,22,40,0.95));
+    margin-bottom: 18px;
+}
+.hero-left { display: flex; align-items: center; gap: 18px; }
+.tl-icon {
+    display: flex; flex-direction: column; gap: 5px; padding: 8px 7px;
+    background: #05090F; border: 1px solid #2A3A5C; border-radius: 12px;
+}
+.tl-icon span { width: 14px; height: 14px; border-radius: 50%; display: block; }
+.tl-icon .r { background: #EF4444; box-shadow: 0 0 12px rgba(239,68,68,.8); }
+.tl-icon .y { background: #3B2A0A; }
+.tl-icon .g { background: #0B2A17; }
+.hero h1 { margin: 0; font-size: 1.65rem; font-weight: 800; letter-spacing: -0.02em; color: #F8FAFC; line-height: 1.25; }
+.hero p { margin: 4px 0 0; color: #94A3B8; font-size: 0.95rem; }
+.chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.chip {
+    font-size: 0.78rem; font-weight: 600; padding: 6px 12px; border-radius: 999px;
+    border: 1px solid #2A3A5C; color: #CBD5E1; background: #0E1628; white-space: nowrap;
+}
+.chip b { color: #38BDF8; }
+
+.strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 8px; }
+@media (max-width: 900px) { .strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.stage {
+    position: relative; padding: 14px 16px; border-radius: 14px; background: #111A2E; border: 1px solid #1F2A44;
+    overflow: hidden;
+}
+.stage::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--c); }
+.stage .k { font-size: 0.72rem; text-transform: uppercase; letter-spacing: .08em; color: #64748B; font-weight: 700; }
+.stage .v { font-size: 1.02rem; font-weight: 700; color: #F1F5F9; margin: 4px 0 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stage .s { font-size: 0.82rem; color: #94A3B8; }
+.stage .s b { font-family: 'JetBrains Mono', monospace; color: var(--c); }
+
+.step { display: flex; align-items: center; gap: 12px; margin: 22px 0 10px; }
+.step .n {
+    width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center;
+    background: rgba(56,189,248,0.12); color: #38BDF8; font-weight: 800; font-family: 'JetBrains Mono', monospace;
+    border: 1px solid rgba(56,189,248,0.35);
+}
+.step .t { font-size: 1.12rem; font-weight: 700; color: #F1F5F9; }
+.step .d { font-size: 0.86rem; color: #94A3B8; margin-left: 4px; }
+
+.kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 6px 0 14px; }
+@media (max-width: 900px) { .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.kpi { padding: 14px 16px; border-radius: 14px; background: #111A2E; border: 1px solid #1F2A44; }
+.kpi .k { font-size: 0.8rem; color: #94A3B8; font-weight: 500; }
+.kpi .v { font-family: 'JetBrains Mono', monospace; font-size: 1.9rem; font-weight: 700; color: #F8FAFC; line-height: 1.2; margin-top: 4px; }
+.kpi.bad { border-color: rgba(239,68,68,0.55); background: linear-gradient(180deg, rgba(239,68,68,0.12), #111A2E); }
+.kpi.bad .v { color: #F87171; }
+.kpi.good .v { color: #4ADE80; }
+@media (max-width: 640px) {
+    .step .d { display: none; }
+    .hero { padding: 18px; }
+    .hero h1 { font-size: 1.35rem; }
+}
+
+.banner { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-radius: 12px; font-weight: 600; margin: 4px 0 14px; }
+.banner.bad { background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.5); color: #FECACA; }
+.banner.good { background: rgba(34,197,94,0.10); border: 1px solid rgba(34,197,94,0.45); color: #BBF7D0; }
+.banner .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.banner.bad .dot { background: #EF4444; box-shadow: 0 0 10px #EF4444; }
+.banner.good .dot { background: #22C55E; box-shadow: 0 0 10px #22C55E; }
+
+.pill { display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px; border-radius: 999px; font-weight: 700; font-size: 0.85rem; }
+.pill i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.pill.RED { background: rgba(239,68,68,.15); color: #FCA5A5; border: 1px solid rgba(239,68,68,.5); } .pill.RED i { background: #EF4444; }
+.pill.GREEN { background: rgba(34,197,94,.12); color: #86EFAC; border: 1px solid rgba(34,197,94,.45); } .pill.GREEN i { background: #22C55E; }
+.pill.YELLOW { background: rgba(245,158,11,.12); color: #FCD34D; border: 1px solid rgba(245,158,11,.45); } .pill.YELLOW i { background: #F59E0B; }
+.pill.UNKNOWN { background: rgba(100,116,139,.15); color: #CBD5E1; border: 1px solid #334155; } .pill.UNKNOWN i { background: #64748B; }
+
+.vcard-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.vcard-title .id { font-family: 'JetBrains Mono', monospace; font-weight: 700; color: #F87171; font-size: 1.02rem; }
+.vcard-title .tm { font-family: 'JetBrains Mono', monospace; color: #94A3B8; font-size: 0.85rem; }
+.vmeta { font-size: 0.86rem; color: #CBD5E1; line-height: 1.7; }
+.vmeta span { color: #64748B; }
+
+.empty {
+    text-align: center; padding: 42px 20px; border: 1.5px dashed #2A3A5C; border-radius: 16px; background: #0E1628;
+}
+.empty .big { font-size: 2.2rem; }
+.empty h4 { margin: 8px 0 6px; color: #E2E8F0; font-weight: 700; }
+.empty p { color: #94A3B8; margin: 0 auto; max-width: 560px; font-size: 0.92rem; }
+
+.flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 900px) { .flow { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.flow div { background: #0E1628; border: 1px solid #1F2A44; border-radius: 12px; padding: 12px 14px; font-size: 0.84rem; color: #94A3B8; }
+.flow b { display: block; color: #E2E8F0; font-size: 0.9rem; margin-bottom: 3px; }
+
+.brand { display: flex; align-items: center; gap: 12px; padding: 4px 0 6px; }
+.brand .tl-icon { padding: 6px 5px; gap: 4px; }
+.brand .tl-icon span { width: 10px; height: 10px; }
+.brand .t { font-weight: 800; color: #F8FAFC; font-size: 1.05rem; line-height: 1.2; }
+.brand .s { color: #94A3B8; font-size: 0.8rem; }
+.sb-sec { font-size: 0.72rem; text-transform: uppercase; letter-spacing: .1em; color: #64748B; font-weight: 700; margin: 14px 0 6px; }
+.sb-sum { background: #111A2E; border: 1px solid #1F2A44; border-radius: 12px; padding: 12px 14px; font-size: 0.86rem; color: #CBD5E1; }
+.sb-sum .row { display: flex; justify-content: space-between; padding: 3px 0; }
+.sb-sum .row b { font-family: 'JetBrains Mono', monospace; color: #F8FAFC; }
+
+.footer { text-align: center; color: #475569; font-size: 0.82rem; margin-top: 36px; padding-top: 16px; border-top: 1px solid #1F2A44; }
+</style>
 """, unsafe_allow_html=True)
 
 if "violations_log" not in st.session_state:
     st.session_state.violations_log = []
 if "analysis" not in st.session_state:
     st.session_state.analysis = None
+if "use_sample" not in st.session_state:
+    st.session_state.use_sample = False
+
 
 # ==========================================
 # CƠ SỞ DỮ LIỆU HIỆU NĂNG MÔ HÌNH (ML BENCHMARK)
@@ -81,6 +233,7 @@ MODEL_PERFORMANCE = {
         "MLP Classifier": {"accuracy": 94.8, "f1": 0.94, "latency": "4.1 ms", "desc": "Dự đoán quỹ đạo chuyển động chính xác"},
     },
 }
+
 
 # ==========================================
 # PIPELINE XỬ LÝ ẢNH / VIDEO THẬT
@@ -287,17 +440,23 @@ def draw_overlay(frame, line, light_rect, light_state, active, info_text):
     cv2.putText(img, "VACH DUNG", (p1[0] + 5, p1[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, line_color, 2)
     x0, y0, x1, y1 = light_rect
     cv2.rectangle(img, (x0, y0), (x1, y1), STATE_COLOR[light_state], 2)
-    cv2.putText(img, f"DEN {STATE_ASCII[light_state]}", (x0, max(15, y0 - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, STATE_COLOR[light_state], 2)
+    lbl = f"DEN {STATE_ASCII[light_state]}"
+    (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+    lx = min(x0, img.shape[1] - tw - 6)
+    ly = y0 - 6 if y0 - 6 >= th + 32 else y1 + th + 6  # tránh đè lên thanh thông tin phía trên
+    cv2.putText(img, lbl, (max(2, lx), ly), cv2.FONT_HERSHEY_SIMPLEX, 0.5, STATE_COLOR[light_state], 2)
     for tid, t in active.items():
         x, y, w, h = t["box"]
         color = BGR_RED if t["violation"] else BGR_GREEN
         cv2.rectangle(img, (x, y), (x + w, y + h), color, 3 if t["violation"] else 2)
         label = f"ID {tid}" + (" VI PHAM" if t["violation"] else "")
-        cv2.putText(img, label, (x, max(15, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        cv2.putText(img, label, (max(2, min(x, img.shape[1] - tw - 4)), max(15, y - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         rp = tuple(int(v) for v in line.ref_point(t["box"]))
         cv2.circle(img, rp, 4, color, -1)
-    cv2.rectangle(img, (0, 0), (min(img.shape[1], 430), 28), (20, 20, 20), -1)
+    (iw, _), _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
+    cv2.rectangle(img, (0, 0), (min(img.shape[1], iw + 16), 28), (20, 20, 20), -1)
     cv2.putText(img, info_text, (8, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
     return img
 
@@ -483,46 +642,7 @@ def decode_upload_image(uploaded):
 
 
 # ==========================================
-# SIDEBAR - CẤU HÌNH & CHỌN MÔ HÌNH
-# ==========================================
-st.sidebar.image("https://img.icons8.com/color/96/traffic-light.png", width=70)
-st.sidebar.title("🎛️ Cấu Hình Máy Học")
-st.sidebar.markdown("**Đồ án Học Máy Truyền Thống - Nhóm 6**")
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("1. Chọn Thuật Toán ML")
-sel_model_a = st.sidebar.selectbox("Mô hình A (Nhận diện Đèn):", list(MODEL_PERFORMANCE["Model_A"].keys()))
-perf_a = MODEL_PERFORMANCE["Model_A"][sel_model_a]
-sel_model_b = st.sidebar.selectbox("Mô hình B (Phát hiện Xe):", list(MODEL_PERFORMANCE["Model_B"].keys()))
-perf_b = MODEL_PERFORMANCE["Model_B"][sel_model_b]
-sel_model_c = st.sidebar.selectbox("Mô hình C (Ghép cặp Xe):", list(MODEL_PERFORMANCE["Model_C"].keys()))
-perf_c = MODEL_PERFORMANCE["Model_C"][sel_model_c]
-
-avg_acc = round((perf_a["accuracy"] + perf_b["accuracy"] + perf_c["accuracy"]) / 3, 1)
-total_latency = round(sum(float(p["latency"].split()[0]) for p in (perf_a, perf_b, perf_c)), 1)
-st.sidebar.markdown(f"""
-<div class="model-info-box">
-    <small style="color: #94a3b8;">Hiệu năng hệ thống được chọn:</small><br>
-    <b>🎯 Độ chính xác trung bình: <span style="color:#10b981;">{avg_acc}%</span></b><br>
-    <b>⏱️ Tổng độ trễ (Latency): <span style="color:#3b82f6;">{total_latency} ms</span></b>
-</div>
-""", unsafe_allow_html=True)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("2. Tình Huống Giả Lập (tab Mô phỏng)")
-scenario = st.sidebar.selectbox(
-    "Chọn kịch bản kiểm thử:",
-    [
-        "Kịch bản 1: Đèn Đỏ - Xe máy Vượt Vạch (Vi Phạm)",
-        "Kịch bản 2: Đèn Đỏ - Ô tô Dừng Đúng Quy Định",
-        "Kịch bản 3: Đèn Xanh - Lưu Thông Bình Thường",
-    ],
-)
-stop_line_y = st.sidebar.slider("Vị trí Vạch dừng mô phỏng (Trục Y):", 200, 400, 320)
-
-
-# ==========================================
-# HÀM TẠO HÌNH ẢNH MÔ PHỎNG (SYNTHETIC SCENE)
+# CẢNH MÔ PHỎNG (SYNTHETIC SCENE)
 # ==========================================
 def generate_traffic_scene(scenario_type, frame_idx=1, stop_y=320):
     width, height = 640, 480
@@ -582,69 +702,166 @@ def generate_traffic_scene(scenario_type, frame_idx=1, stop_y=320):
 
 
 # ==========================================
-# GIAO DIỆN CHÍNH - HEADER & METRICS
+# TIỆN ÍCH GIAO DIỆN
+# ==========================================
+def style_fig(fig, height=None, title=None):
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Be Vietnam Pro, system-ui, sans-serif", color=C_TEXT, size=13),
+        margin=dict(l=8, r=8, t=48 if (title or fig.layout.title.text) else 12, b=8),
+        title=dict(text=title, font=dict(size=15)) if title else fig.layout.title,
+        hoverlabel=dict(bgcolor=C_PANEL, bordercolor=C_LINE, font_color=C_TEXT),
+    )
+    fig.update_xaxes(gridcolor=C_LINE, zerolinecolor=C_LINE, linecolor=C_LINE)
+    fig.update_yaxes(gridcolor=C_LINE, zerolinecolor=C_LINE, linecolor=C_LINE)
+    if height:
+        fig.update_layout(height=height)
+    return fig
+
+
+def step(n, title, desc=""):
+    st.markdown(f'<div class="step"><div class="n">{n}</div><div class="t">{title}</div>'
+                f'<div class="d">{desc}</div></div>', unsafe_allow_html=True)
+
+
+def pill(state, prefix="Đèn"):
+    return f'<span class="pill {state}"><i></i>{prefix} {STATE_VN[state].lower()}</span>'
+
+
+def banner(text, good):
+    st.markdown(f'<div class="banner {"good" if good else "bad"}"><span class="dot"></span>{text}</div>',
+                unsafe_allow_html=True)
+
+
+def violation_time(v):
+    try:
+        return float(str(v["ThoiDiem"]).split()[0])
+    except (ValueError, KeyError, IndexError):
+        return None
+
+
+def light_timeline_fig(timeline, violations):
+    """Dải màu thể hiện trạng thái đèn theo thời gian + vạch đánh dấu thời điểm vi phạm."""
+    colors = {"RED": C_RED, "YELLOW": C_AMBER, "GREEN": C_GREEN, "UNKNOWN": "#334155"}
+    segs = []
+    for t, s in timeline:
+        if segs and segs[-1][2] == s:
+            segs[-1][1] = t
+        else:
+            if segs:
+                segs[-1][1] = t
+            segs.append([t, t, s])
+    if segs and len(timeline) > 1:
+        segs[-1][1] = timeline[-1][0] + (timeline[-1][0] - timeline[-2][0])
+    fig = go.Figure()
+    shown = set()
+    for start, end, s in segs:
+        fig.add_trace(go.Bar(
+            x=[max(end - start, 1e-3)], y=["Đèn"], base=[start], orientation="h",
+            marker=dict(color=colors[s], line=dict(width=0)), name=STATE_VN[s],
+            showlegend=s not in shown, legendgroup=s,
+            hovertemplate=f"{STATE_VN[s]}: %{{base:.1f}}s → {end:.1f}s<extra></extra>",
+        ))
+        shown.add(s)
+    for v in violations:
+        tv = violation_time(v)
+        if tv is not None:
+            fig.add_vline(x=tv, line=dict(color="#F8FAFC", width=2, dash="dot"))
+            fig.add_annotation(x=tv, y=1.0, yref="paper", text=v["MaXe"], showarrow=False, yanchor="bottom",
+                               font=dict(color="#FCA5A5", size=12, family="JetBrains Mono, monospace"))
+    fig.update_layout(barmode="overlay", bargap=0.35,
+                      legend=dict(orientation="h", y=-0.45, x=0, font=dict(size=12)))
+    fig.update_xaxes(title="Thời điểm (giây)")
+    fig.update_yaxes(showticklabels=False)
+    style_fig(fig, height=220)
+    fig.update_layout(margin=dict(l=8, r=8, t=30, b=8))
+    return fig
+
+
+# ==========================================
+# SIDEBAR
+# ==========================================
+with st.sidebar:
+    st.markdown("""
+    <div class="brand">
+        <div class="tl-icon"><span class="r"></span><span class="y"></span><span class="g"></span></div>
+        <div><div class="t">Giám sát vượt đèn đỏ</div><div class="s">Đồ án Học Máy Truyền Thống · Nhóm 6</div></div>
+    </div>""", unsafe_allow_html=True)
+
+    st.markdown('<div class="sb-sec">Thuật toán cho từng mô hình</div>', unsafe_allow_html=True)
+    sel_model_a = st.selectbox("Mô hình A · Nhận diện đèn", list(MODEL_PERFORMANCE["Model_A"].keys()))
+    sel_model_b = st.selectbox("Mô hình B · Phát hiện xe", list(MODEL_PERFORMANCE["Model_B"].keys()))
+    sel_model_c = st.selectbox("Mô hình C · Ghép cặp xe", list(MODEL_PERFORMANCE["Model_C"].keys()))
+    perf_a = MODEL_PERFORMANCE["Model_A"][sel_model_a]
+    perf_b = MODEL_PERFORMANCE["Model_B"][sel_model_b]
+    perf_c = MODEL_PERFORMANCE["Model_C"][sel_model_c]
+    avg_acc = round((perf_a["accuracy"] + perf_b["accuracy"] + perf_c["accuracy"]) / 3, 1)
+    total_latency = round(sum(float(p["latency"].split()[0]) for p in (perf_a, perf_b, perf_c)), 1)
+    st.markdown(f"""
+    <div class="sb-sum">
+        <div class="row"><span>Độ chính xác trung bình</span><b style="color:{C_GREEN}">{avg_acc}%</b></div>
+        <div class="row"><span>Tổng độ trễ</span><b style="color:{C_ACCENT}">{total_latency} ms</b></div>
+    </div>""", unsafe_allow_html=True)
+
+    st.markdown('<div class="sb-sec">Tab mô phỏng</div>', unsafe_allow_html=True)
+    scenario = st.selectbox("Kịch bản kiểm thử", [
+        "Kịch bản 1: Đèn Đỏ - Xe máy Vượt Vạch (Vi Phạm)",
+        "Kịch bản 2: Đèn Đỏ - Ô tô Dừng Đúng Quy Định",
+        "Kịch bản 3: Đèn Xanh - Lưu Thông Bình Thường",
+    ], format_func=lambda s: s.split(": ", 1)[1])
+    stop_line_y = st.slider("Vị trí vạch dừng (trục Y)", 200, 400, 320)
+
+
+# ==========================================
+# HEADER
 # ==========================================
 st.markdown("""
-<div class="main-header">
-    <h1 style="margin:0; font-size: 2.2rem; color: #f8fafc;">🚦 Hệ Thống Phát Hiện & Cảnh Báo Xe Vi Phạm Vượt Đèn Đỏ</h1>
-    <p style="margin-top:8px; color: #94a3b8; font-size: 1.05rem;">
-        Phương pháp Máy học Truyền thống (Traditional ML Pipeline) | Đặc trưng <b>HSV + HOG</b> | Trừ nền <b>MOG2</b> | Ghép cặp <b>Hungarian</b>
-    </p>
+<div class="hero">
+    <div class="hero-left">
+        <div class="tl-icon"><span class="r"></span><span class="y"></span><span class="g"></span></div>
+        <div>
+            <h1>Phát hiện & cảnh báo xe vượt đèn đỏ</h1>
+            <p>Pipeline máy học truyền thống chạy trên ảnh và video thật từ camera giao thông</p>
+        </div>
+    </div>
+    <div class="chips">
+        <span class="chip">Đèn · <b>HSV</b></span>
+        <span class="chip">Xe · <b>MOG2 + HOG</b></span>
+        <span class="chip">Ghép cặp · <b>Hungarian</b></span>
+    </div>
 </div>
 """, unsafe_allow_html=True)
 
-c1, c2, c3, c4 = st.columns(4)
-for col, title, name, perf, color in [
-    (c1, "Mô hình A (Đèn)", sel_model_a, perf_a, "#3b82f6"),
-    (c2, "Mô hình B (Phát hiện Xe)", sel_model_b, perf_b, "#8b5cf6"),
-    (c3, "Mô hình C (Ghép cặp Xe)", sel_model_c, perf_c, "#ec4899"),
-]:
-    with col:
-        st.markdown(f"""
-        <div class="metric-card" style="border-left-color: {color};">
-            <small style="color:#94a3b8">{title}</small>
-            <h3 style="margin:0; color:{color}">{name}</h3>
-            <span style="color:#10b981; font-weight:bold">Accuracy: {perf['accuracy']}%</span>
-        </div>""", unsafe_allow_html=True)
-with c4:
-    st.markdown(f"""
-    <div class="metric-card" style="border-left-color: #ef4444;">
-        <small style="color:#94a3b8">Nhật ký Vi phạm</small>
-        <h3 style="margin:0; color:#ef4444">{len(st.session_state.violations_log)} lượt</h3>
-        <span style="color:#f59e0b; font-weight:bold">Đã lưu tự động</span>
-    </div>""", unsafe_allow_html=True)
-
-st.markdown("<br>", unsafe_allow_html=True)
+st.markdown(f"""
+<div class="strip">
+    <div class="stage" style="--c:{C_ACCENT}"><div class="k">Mô hình A · Đèn</div>
+        <div class="v">{sel_model_a}</div><div class="s">Accuracy <b>{perf_a['accuracy']}%</b> · {perf_a['latency']}</div></div>
+    <div class="stage" style="--c:#A78BFA"><div class="k">Mô hình B · Phát hiện xe</div>
+        <div class="v">{sel_model_b}</div><div class="s">Accuracy <b>{perf_b['accuracy']}%</b> · {perf_b['latency']}</div></div>
+    <div class="stage" style="--c:#F472B6"><div class="k">Mô hình C · Ghép cặp xe</div>
+        <div class="v">{sel_model_c}</div><div class="s">Accuracy <b>{perf_c['accuracy']}%</b> · {perf_c['latency']}</div></div>
+    <div class="stage" style="--c:{C_RED}"><div class="k">Nhật ký vi phạm</div>
+        <div class="v">{len(st.session_state.violations_log)} lượt</div><div class="s">Lưu trong phiên làm việc này</div></div>
+</div>
+""", unsafe_allow_html=True)
 
 tab_real, tab_sim, tab_bench, tab_feat, tab_log = st.tabs([
-    "🎥 PHÂN TÍCH ẢNH / VIDEO THẬT",
-    "📹 MÔ PHỎNG PIPELINE (FRAME t → t+1)",
-    "📈 SO SÁNH HIỆU NĂNG MÔ HÌNH",
-    "🎨 GIẢI MÃ ĐẶC TRƯNG (HSV & HOG)",
-    "📋 NHẬT KÝ VI PHẠM & EXPORT",
+    "Phân tích ảnh / video", "Mô phỏng pipeline", "Hiệu năng mô hình", "Đặc trưng HSV & HOG", "Nhật ký vi phạm",
 ])
 
-# ------------------------------------------
+# ==========================================
 # TAB 1: PHÂN TÍCH ẢNH / VIDEO THẬT
-# ------------------------------------------
+# ==========================================
 with tab_real:
-    st.subheader("🎥 Tải ảnh hoặc video từ camera giao thông để kiểm tra vi phạm")
-    st.markdown("""
-    <div class="pipeline-box">
-    <b>Quy trình:</b> ① <b>Mô hình A</b> đọc màu đèn trong vùng đèn (ngưỡng HSV) →
-    ② <b>Mô hình B</b> tách xe khỏi nền đường (trừ nền MOG2 + contour) →
-    ③ <b>Mô hình C</b> ghép cùng một xe giữa các khung hình (khoảng cách tâm + Hungarian) →
-    ④ Xe có <b>đầu xe đi từ trước vạch sang sau vạch khi đèn ĐỎ</b> ⇒ <b>VI PHẠM</b>.
-    <br><small>Yêu cầu: camera đặt cố định (không rung, không lia), nhìn thấy vạch dừng; nên thấy cả đèn giao thông.</small>
-    </div>
-    """, unsafe_allow_html=True)
-    st.write("")
-
-    input_type = st.radio("Loại dữ liệu:", ["🎥 Video", "🖼️ Ảnh"], horizontal=True)
+    step(1, "Dữ liệu đầu vào", "Video hoặc ảnh từ camera đặt cố định tại ngã tư")
+    input_type = st.segmented_control("Loại dữ liệu", ["🎥 Video", "🖼️ Ảnh"], default="🎥 Video",
+                                      label_visibility="collapsed") or "🎥 Video"
     preview, source_key, video_path, images, background = None, None, None, [], None
+    has_sample = os.path.exists(SAMPLE_VIDEO)
 
     if input_type == "🎥 Video":
-        up = st.file_uploader("Tải video lên (mp4, avi, mov, mkv)", type=["mp4", "avi", "mov", "mkv", "m4v"])
+        up = st.file_uploader("Tải video lên", type=["mp4", "avi", "mov", "mkv", "m4v"],
+                              help="Nên dùng video quay từ camera đứng yên, thấy rõ vạch dừng và đèn giao thông.")
         if up is not None:
             source_key = f"vid:{up.name}:{up.size}"
             if st.session_state.get("video_key") != source_key:
@@ -655,61 +872,97 @@ with tab_real:
                 st.session_state.video_key = source_key
                 st.session_state.video_path = tmp.name
             video_path = st.session_state.video_path
+        elif st.session_state.use_sample and has_sample:
+            source_key, video_path = "vid:video_thu.mp4:sample", SAMPLE_VIDEO
+            c_s1, c_s2 = st.columns([4, 1])
+            c_s1.caption("Đang dùng **video mẫu** (video_thu.mp4). Tải video của bạn lên để thay thế.")
+            if c_s2.button("Bỏ video mẫu", width="stretch"):
+                st.session_state.use_sample = False
+                st.rerun()
+        if video_path:
             preview = read_first_frame(video_path)
             if preview is None:
-                st.error("Không đọc được video này. Hãy thử đổi sang định dạng .mp4 (H.264).")
+                banner("Không đọc được video này. Hãy chuyển sang định dạng .mp4 (H.264) rồi thử lại.", good=False)
     else:
-        ups = st.file_uploader("Tải ảnh lên (1 ảnh, hoặc nhiều ảnh chụp liên tiếp từ cùng một góc camera)",
-                               type=["jpg", "jpeg", "png", "bmp", "webp"], accept_multiple_files=True)
-        bg_up = st.file_uploader("Ảnh nền: cùng góc camera nhưng đường trống, không có xe (bắt buộc nếu chỉ có 1–2 ảnh)",
-                                 type=["jpg", "jpeg", "png", "bmp", "webp"])
+        c_i1, c_i2 = st.columns(2)
+        ups = c_i1.file_uploader("Ảnh cần kiểm tra (1 ảnh hoặc nhiều ảnh liên tiếp, cùng góc camera)",
+                                 type=["jpg", "jpeg", "png", "bmp", "webp"], accept_multiple_files=True)
+        bg_up = c_i2.file_uploader("Ảnh nền: cùng góc camera nhưng đường trống",
+                                   type=["jpg", "jpeg", "png", "bmp", "webp"],
+                                   help="Bắt buộc nếu chỉ có 1–2 ảnh. Từ 3 ảnh trở lên, hệ thống tự ước lượng nền.")
         if ups:
             ups = sorted(ups, key=lambda f: f.name)
-            first = resize_frame(decode_upload_image(ups[0]))
-            size = (first.shape[1], first.shape[0])
-            images = [first] + [resize_frame(decode_upload_image(u), size) for u in ups[1:]]
-            if bg_up is not None:
-                background = resize_frame(decode_upload_image(bg_up), size)
-            elif len(images) >= 3:
-                background = np.median(np.stack(images), axis=0).astype(np.uint8)
-            preview = images[0]
-            source_key = "img:" + "|".join(f"{u.name}:{u.size}" for u in ups) + (f"|bg:{bg_up.name}" if bg_up else "")
+            decoded = [decode_upload_image(u) for u in ups]
+            if any(d is None for d in decoded):
+                banner("Có ảnh không đọc được. Hãy dùng ảnh JPG hoặc PNG.", good=False)
+            else:
+                first = resize_frame(decoded[0])
+                size = (first.shape[1], first.shape[0])
+                images = [first] + [resize_frame(d, size) for d in decoded[1:]]
+                if bg_up is not None and decode_upload_image(bg_up) is not None:
+                    background = resize_frame(decode_upload_image(bg_up), size)
+                elif len(images) >= 3:
+                    background = np.median(np.stack(images), axis=0).astype(np.uint8)
+                preview = images[0]
+                source_key = "img:" + "|".join(f"{u.name}:{u.size}" for u in ups) + (f"|bg:{bg_up.name}" if bg_up else "")
 
-    if preview is not None:
-        st.markdown("#### ⚙️ Bước 1: Đặt vạch dừng và vùng đèn cho khớp với hình")
-        col_cfg, col_prev = st.columns([1, 1.4])
+    if preview is None:
+        st.markdown("""
+        <div class="empty">
+            <div class="big">🚦</div>
+            <h4>Chưa có dữ liệu</h4>
+            <p>Tải lên một video quay ngã tư từ camera cố định. Hệ thống sẽ đọc màu đèn, tìm từng phương tiện,
+            theo dõi chúng qua các khung hình và đánh dấu xe nào vượt vạch dừng khi đèn đỏ.</p>
+        </div>""", unsafe_allow_html=True)
+        if input_type == "🎥 Video" and has_sample:
+            _, mid, _ = st.columns([2, 1.2, 2])
+            if mid.button("▶  Thử với video mẫu", type="primary", width="stretch"):
+                st.session_state.use_sample = True
+                st.rerun()
+        st.write("")
+        st.markdown("""
+        <div class="flow">
+            <div><b>① Mô hình A</b>Đọc màu đèn trong vùng đèn theo ngưỡng màu HSV.</div>
+            <div><b>② Mô hình B</b>Tách xe khỏi nền đường bằng trừ nền MOG2 + contour.</div>
+            <div><b>③ Mô hình C</b>Ghép cùng một xe giữa các khung hình bằng thuật toán Hungarian.</div>
+            <div><b>④ Kết luận</b>Đầu xe đi từ trước vạch sang sau vạch khi đèn đỏ ⇒ vi phạm.</div>
+        </div>""", unsafe_allow_html=True)
+
+    else:
+        step(2, "Hiệu chỉnh vạch dừng & vùng đèn", "Kéo cho khớp với hình xem trước bên phải")
+        col_cfg, col_prev = st.columns([1, 1.45], gap="large")
         with col_cfg:
-            st.markdown("**🟨 Vạch dừng** (tính theo % chiều rộng / chiều cao khung hình)")
-            a1, a2 = st.columns(2)
-            lx1 = a1.slider("Điểm trái – ngang (x1)", 0, 100, 5, key="lx1")
-            ly1 = a1.slider("Điểm trái – dọc (y1)", 0, 100, 65, key="ly1")
-            lx2 = a2.slider("Điểm phải – ngang (x2)", 0, 100, 95, key="lx2")
-            ly2 = a2.slider("Điểm phải – dọc (y2)", 0, 100, 65, key="ly2")
-            direction_lbl = st.radio("Hướng xe chạy trong hình:",
-                                     ["⬇️ Từ trên xuống (về phía camera)", "⬆️ Từ dưới lên (ra xa camera)"],
-                                     key="direction")
-            direction = "down" if direction_lbl.startswith("⬇️") else "up"
-
-            st.markdown("**🚦 Vùng đèn giao thông**")
-            b1, b2 = st.columns(2)
-            rx = b1.slider("Vị trí ngang (x)", 0, 99, 85, key="rx")
-            ry = b1.slider("Vị trí dọc (y)", 0, 99, 5, key="ry")
-            rw = b2.slider("Rộng", 1, 50, 10, key="rw")
-            rh = b2.slider("Cao", 1, 60, 25, key="rh")
-            light_choice = st.selectbox("Trạng thái đèn:", [
-                "Tự động nhận diện màu trong vùng đèn (HSV)",
-                "Video không thấy đèn – coi như luôn ĐỎ",
-                "Coi như luôn XANH",
-            ], key="light_choice")
-            light_mode = {"Tự": "auto", "Vid": "red", "Coi": "green"}[light_choice[:3].strip()]
-
-            with st.expander("🔧 Tinh chỉnh nâng cao"):
+            with st.container(border=True):
+                st.markdown("**Vạch dừng** · tính theo % khung hình")
+                a1, a2 = st.columns(2)
+                lx1 = a1.slider("Đầu trái · ngang", 0, 100, 5, key="lx1")
+                ly1 = a1.slider("Đầu trái · dọc", 0, 100, 65, key="ly1")
+                lx2 = a2.slider("Đầu phải · ngang", 0, 100, 95, key="lx2")
+                ly2 = a2.slider("Đầu phải · dọc", 0, 100, 65, key="ly2")
+                direction_lbl = st.radio("Hướng xe chạy", ["Từ trên xuống ↓", "Từ dưới lên ↑"],
+                                         horizontal=True, key="direction")
+                direction = "down" if direction_lbl.startswith("Từ trên") else "up"
+            with st.container(border=True):
+                st.markdown("**Vùng đèn giao thông**")
+                b1, b2 = st.columns(2)
+                rx = b1.slider("Vị trí ngang", 0, 99, 85, key="rx")
+                ry = b1.slider("Vị trí dọc", 0, 99, 5, key="ry")
+                rw = b2.slider("Chiều rộng", 1, 50, 10, key="rw")
+                rh = b2.slider("Chiều cao", 1, 60, 25, key="rh")
+                light_options = {
+                    "auto": "Tự động nhận diện màu đèn",
+                    "red": "Không thấy đèn trong hình · coi như luôn đỏ",
+                    "green": "Coi như luôn xanh",
+                }
+                light_mode = st.selectbox("Trạng thái đèn", list(light_options), format_func=light_options.get,
+                                          key="light_mode")
+            with st.expander("Tinh chỉnh nâng cao"):
                 min_area_pct = st.slider("Diện tích xe nhỏ nhất (% khung hình)", 0.05, 5.0, 0.4, 0.05,
-                                         help="Tăng lên nếu bị nhận nhầm lá cây, người đi bộ, nhiễu là xe.")
-                car_area_pct = st.slider("Từ mức này trở lên coi là ô tô (% khung hình)", 0.5, 15.0, 2.5, 0.5)
-                sensitivity = st.slider("Độ nhạy trừ nền (càng nhỏ càng nhạy)", 8, 80, 32)
-                frame_step = st.slider("Xử lý 1 khung trên mỗi N khung (tăng để chạy nhanh hơn)", 1, 6, 2)
-                max_seconds = st.slider("Chỉ phân tích tối đa (giây đầu video)", 5, 180, 60)
+                                         help="Tăng lên nếu lá cây, người đi bộ hoặc nhiễu bị nhận nhầm là xe.")
+                car_area_pct = st.slider("Ngưỡng coi là ô tô (% khung hình)", 0.5, 15.0, 2.5, 0.5)
+                sensitivity = st.slider("Độ nhạy trừ nền (nhỏ = nhạy hơn)", 8, 80, 32)
+                frame_step = st.slider("Xử lý 1 trên mỗi N khung (lớn = nhanh hơn)", 1, 6, 2)
+                max_seconds = st.slider("Chỉ phân tích tối đa N giây đầu video", 5, 180, 60)
 
         cfg = dict(line=(lx1, ly1, lx2, ly2), direction=direction, light_roi=(rx, ry, rw, rh),
                    light_mode=light_mode, min_area_pct=min_area_pct, car_area_pct=car_area_pct,
@@ -723,221 +976,254 @@ with tab_real:
                 prev_state, _ = classify_light(preview[y0:y1, x0:x1])
             else:
                 prev_state = "RED" if light_mode == "red" else "GREEN"
-            prev_img = draw_overlay(preview, line_prev, rect_prev, prev_state, {}, "Xem truoc - chinh vach dung & vung den")
+            prev_img = draw_overlay(preview, line_prev, rect_prev, prev_state, {}, "Xem truoc")
             p1, p2 = line_prev.pts()
             mid = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
-            arrow_dy = 40 if direction == "down" else -40
-            cv2.arrowedLine(prev_img, (mid[0], mid[1] - arrow_dy), (mid[0], mid[1] + arrow_dy), (255, 255, 0), 2, tipLength=0.3)
-            st.image(prev_img, channels="BGR", caption="Xem trước: vạch dừng, vùng đèn và hướng xe chạy (mũi tên)", width="stretch")
-            badge = {"RED": "badge-red", "GREEN": "badge-green", "YELLOW": "badge-yellow"}.get(prev_state, "badge-gray")
-            st.markdown(f'Đèn ở khung đầu tiên: <span class="{badge}">{STATE_VN[prev_state].upper()}</span>', unsafe_allow_html=True)
-            if prev_state == "UNKNOWN" and light_mode == "auto":
-                st.caption("⚠️ Chưa thấy đèn sáng trong khung xanh dương. Hãy kéo vùng đèn trùng với cột đèn, hoặc chọn 'coi như luôn ĐỎ'.")
+            dy = 45 if direction == "down" else -45
+            cv2.arrowedLine(prev_img, (mid[0], mid[1] - dy), (mid[0], mid[1] + dy // 3), (248, 189, 56), 3, tipLength=0.35)
+            with st.container(border=True):
+                st.image(prev_img, channels="BGR", width="stretch")
+                st.markdown(f"Khung hình đầu tiên &nbsp; {pill(prev_state)} &nbsp;"
+                            f"<span style='color:{C_MUTED};font-size:.85rem'>· mũi tên xanh = hướng xe chạy</span>",
+                            unsafe_allow_html=True)
+                if prev_state == "UNKNOWN" and light_mode == "auto":
+                    st.caption("Chưa thấy đèn sáng trong khung đèn. Kéo khung trùng với cột đèn, "
+                               "hoặc chọn “coi như luôn đỏ” nếu video không quay được đèn.")
 
-        st.markdown("#### 🚀 Bước 2: Phân tích")
-        can_run = True
-        if input_type == "🖼️ Ảnh" and background is None:
-            can_run = False
-            st.warning("Với 1–2 ảnh, hãy tải thêm **ảnh nền đường trống** (cùng góc chụp), hoặc tải từ 3 ảnh liên tiếp trở lên.")
-
-        if st.button("🔍 Phân tích vi phạm", type="primary", disabled=not can_run):
+        step(3, "Phân tích", "")
+        can_run = not (input_type == "🖼️ Ảnh" and background is None)
+        if not can_run:
+            banner("Với 1–2 ảnh, hãy tải thêm ảnh nền đường trống, hoặc tải từ 3 ảnh liên tiếp trở lên.", good=False)
+        run = st.button("🔍  Phân tích vi phạm", type="primary", disabled=not can_run, width="stretch")
+        if run:
             progress = st.progress(0.0, text="Đang chuẩn bị...")
-            if input_type == "🎥 Video":
-                res = analyze_video(video_path, cfg, progress)
-            else:
-                frames = ((float(i), img) for i, img in enumerate(images))
-                res = analyze_frames(frames, cfg, fps_eff=1.0, background=background,
-                                     progress=progress, total=len(images))
+            try:
+                if input_type == "🎥 Video":
+                    res = analyze_video(video_path, cfg, progress)
+                else:
+                    frames = ((float(i), img) for i, img in enumerate(images))
+                    res = analyze_frames(frames, cfg, fps_eff=1.0, background=background,
+                                         progress=progress, total=len(images))
+            except Exception as exc:  # hiển thị lỗi gọn gàng thay vì vỡ trang
+                res = None
+                banner(f"Xử lý bị lỗi: {exc}", good=False)
             progress.empty()
-            if res is None:
-                st.error("Không xử lý được dữ liệu.")
-            else:
+            if res is not None:
                 res["source"] = source_key
                 res["kind"] = "video" if input_type == "🎥 Video" else "image"
                 st.session_state.analysis = res
-                now = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
+                now = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
                 src_name = source_key.split(":")[1] if source_key else ""
                 for v in res["violations"]:
                     st.session_state.violations_log.append({
-                        "MaXe": v["MaXe"], "LoaiXe": v["LoaiXe"], "ThoiDiemTrongVideo": v["ThoiDiem"],
-                        "TrangThaiDen": v["TrangThaiDen"], "ViTri": v["ViTri"],
-                        "NguonDuLieu": src_name, "ThoiGianPhanTich": now,
+                        "Mã xe": v["MaXe"], "Loại xe": v["LoaiXe"], "Thời điểm": v["ThoiDiem"],
+                        "Đèn": v["TrangThaiDen"], "Vị trí": v["ViTri"],
+                        "Nguồn": src_name, "Phân tích lúc": now,
                     })
+                st.rerun()
 
-    # ---------- Kết quả ----------
-    res = st.session_state.analysis
-    if res is not None and res.get("source") == source_key:
-        st.markdown("#### 📊 Bước 3: Kết quả")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Số xe phát hiện", res["n_vehicles"])
-        m2.metric("🚨 Vi phạm vượt đèn đỏ", len(res["violations"]))
-        m3.metric("Qua vạch hợp lệ (đèn xanh/vàng)", res["crossed_ok"])
-        if res["kind"] == "video":
-            m4.metric("Thời lượng đã phân tích", f"{res['duration']:.1f} s")
-        else:
-            m4.metric("Số ảnh đã phân tích", res["n_frames"])
-
-        if res["violations"]:
-            for v in res["violations"]:
-                st.markdown(f"""<div class="alert-violation">🚨 CẢNH BÁO VI PHẠM: {v['MaXe']} – {v['LoaiXe']}
-                    đã vượt qua vạch dừng khi đèn đỏ (thời điểm {v['ThoiDiem']}).</div>""", unsafe_allow_html=True)
-        else:
-            st.success("✅ Không phát hiện xe nào vượt vạch dừng khi đèn đỏ.")
-
-        if res["kind"] == "video":
-            st.markdown("##### 🎬 Video kết quả (khung xanh = xe bình thường, khung đỏ = xe vi phạm)")
-            if res["video_browser_ok"]:
-                st.video(res["video_bytes"], format="video/mp4")
+        # ---------- Kết quả ----------
+        res = st.session_state.analysis
+        if res is not None and res.get("source") == source_key:
+            step(4, "Kết quả", "")
+            n_v = len(res["violations"])
+            last = f"{res['duration']:.1f}s" if res["kind"] == "video" else str(res["n_frames"])
+            last_lbl = "Thời lượng đã xét" if res["kind"] == "video" else "Số ảnh đã xét"
+            st.markdown(f"""
+            <div class="kpis">
+                <div class="kpi"><div class="k">Phương tiện phát hiện</div><div class="v">{res['n_vehicles']}</div></div>
+                <div class="kpi {'bad' if n_v else 'good'}"><div class="k">Vượt đèn đỏ</div><div class="v">{n_v}</div></div>
+                <div class="kpi good"><div class="k">Qua vạch hợp lệ</div><div class="v">{res['crossed_ok']}</div></div>
+                <div class="kpi"><div class="k">{last_lbl}</div><div class="v">{last}</div></div>
+            </div>""", unsafe_allow_html=True)
+            if n_v:
+                banner(f"Phát hiện {n_v} phương tiện vượt vạch dừng khi đèn đỏ.", good=False)
             else:
-                st.info("Máy chủ thiếu bộ mã hoá H.264 nên trình duyệt không phát trực tiếp được. Hãy tải video về để xem.")
-            st.download_button("📥 Tải video kết quả", res["video_bytes"], file_name="ket_qua_phan_tich.mp4", mime="video/mp4")
+                banner("Không có phương tiện nào vượt vạch dừng khi đèn đỏ.", good=True)
 
-            tl = pd.DataFrame(res["timeline"], columns=["Thời điểm (s)", "Đèn"])
-            tl["Đèn"] = tl["Đèn"].map(STATE_VN)
-            fig_tl = px.scatter(tl, x="Thời điểm (s)", y="Đèn", color="Đèn",
-                                color_discrete_map={"Đỏ": "#ef4444", "Xanh": "#10b981", "Vàng": "#f59e0b", "Không rõ": "#64748b"},
-                                category_orders={"Đèn": ["Đỏ", "Vàng", "Xanh", "Không rõ"]},
-                                title="Trạng thái đèn theo thời gian (Mô hình A)")
-            fig_tl.update_traces(marker=dict(size=6, symbol="square"))
-            fig_tl.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="white",
-                                 height=260, showlegend=False)
-            st.plotly_chart(fig_tl, width="stretch")
-        else:
-            st.markdown("##### 🖼️ Ảnh kết quả")
-            cols = st.columns(min(3, len(res["annotated"])))
-            for i, img in enumerate(res["annotated"]):
-                cols[i % len(cols)].image(img, channels="BGR", caption=f"Ảnh {i + 1}", width="stretch")
+            col_main, col_list = st.columns([1.75, 1], gap="large")
+            with col_main:
+                with st.container(border=True):
+                    if res["kind"] == "video":
+                        st.markdown("**Video kết quả** · khung xanh = bình thường, khung đỏ = vi phạm")
+                        if res["video_browser_ok"]:
+                            st.video(res["video_bytes"], format="video/mp4")
+                        else:
+                            st.caption("Máy chủ thiếu bộ mã hoá H.264 nên không phát trực tiếp được. Hãy tải video về để xem.")
+                        st.download_button("⬇  Tải video kết quả (.mp4)", res["video_bytes"],
+                                           file_name="ket_qua_phan_tich.mp4", mime="video/mp4", width="stretch")
+                    else:
+                        st.markdown("**Ảnh kết quả** · khung xanh = bình thường, khung đỏ = vi phạm")
+                        cols = st.columns(min(2, len(res["annotated"])))
+                        for i, img in enumerate(res["annotated"]):
+                            cols[i % len(cols)].image(img, channels="BGR", caption=f"Ảnh {i + 1}", width="stretch")
+            with col_list:
+                st.markdown(f"**Danh sách vi phạm** · {n_v}")
+                if not n_v:
+                    st.caption("Chưa có phương tiện vi phạm trong dữ liệu này.")
+                box = st.container(height=560, border=False) if n_v > 2 else st.container()
+                with box:
+                    for k, v in enumerate(res["violations"]):
+                        with st.container(border=True):
+                            st.markdown(f'<div class="vcard-title"><span class="id">{v["MaXe"]}</span>'
+                                        f'<span class="tm">⏱ {v["ThoiDiem"]}</span></div>', unsafe_allow_html=True)
+                            ci, cm = st.columns([1, 1.3])
+                            ci.image(v["crop"], width="stretch")
+                            cm.markdown(f'<div class="vmeta"><span>Loại xe</span><br>{v["LoaiXe"]}<br>'
+                                        f'<span>Đèn</span><br>{pill("RED")}</div>', unsafe_allow_html=True)
+                            st.download_button("⬇  Ảnh bằng chứng", v["snapshot"], file_name=f"vi_pham_{v['MaXe']}.jpg",
+                                               mime="image/jpeg", key=f"dl_{k}_{v['MaXe']}", width="stretch")
 
-        if res["violations"]:
-            st.markdown("##### 📸 Ảnh bằng chứng vi phạm")
-            for v in res["violations"]:
-                e1, e2 = st.columns([2, 1])
-                e1.image(v["snapshot"], caption=f"{v['MaXe']} – khoảnh khắc vượt vạch ({v['ThoiDiem']})", width="stretch")
-                e2.image(v["crop"], caption="Ảnh cận phương tiện", width="stretch")
-                e2.markdown(f"**Mã xe:** {v['MaXe']}  \n**Loại xe:** {v['LoaiXe']}  \n**Đèn:** {v['TrangThaiDen']}  \n**Vị trí:** {v['ViTri']}")
-                e2.download_button("📥 Tải ảnh bằng chứng", v["snapshot"], file_name=f"vi_pham_{v['MaXe']}.jpg",
-                                   mime="image/jpeg", key=f"dl_{v['MaXe']}_{v['ThoiDiem']}")
+            if res["kind"] == "video" and res["timeline"]:
+                with st.container(border=True):
+                    st.markdown("**Trạng thái đèn theo thời gian** · Mô hình A, vạch chấm = thời điểm vi phạm")
+                    st.plotly_chart(light_timeline_fig(res["timeline"], res["violations"]), width="stretch",
+                                    config={"displayModeBar": False})
 
-        st.caption("Gợi ý: nếu kết quả chưa đúng, hãy chỉnh lại vạch dừng/vùng đèn hoặc mở 'Tinh chỉnh nâng cao' rồi bấm Phân tích lại.")
-    elif preview is None:
-        st.info("⬆️ Hãy tải lên một video (hoặc ảnh) quay từ camera cố định tại ngã tư để bắt đầu.")
+            if n_v:
+                st.markdown("**Ảnh toàn cảnh tại khoảnh khắc vượt vạch**")
+                gcols = st.columns(3)
+                for k, v in enumerate(res["violations"]):
+                    gcols[k % 3].image(v["snapshot"], caption=f"{v['MaXe']} · {v['ThoiDiem']}", width="stretch")
 
-# ------------------------------------------
-# TAB 2: MÔ PHỎNG PIPELINE
-# ------------------------------------------
+            st.caption("Kết quả chưa đúng? Chỉnh lại vạch dừng, vùng đèn hoặc mục “Tinh chỉnh nâng cao” rồi bấm Phân tích lại.")
+
+# ==========================================
+# TAB 2: MÔ PHỎNG
+# ==========================================
 with tab_sim:
-    st.subheader("🔍 Mô phỏng chuỗi xử lý phát hiện vượt đèn đỏ (dữ liệu giả lập)")
     f1_img, l_state, _ = generate_traffic_scene(scenario, frame_idx=1, stop_y=stop_line_y)
     f2_img, l_state, sim_violations = generate_traffic_scene(scenario, frame_idx=2, stop_y=stop_line_y)
-
-    st.write("##### **Kết quả Mô hình A (Nhận diện Đèn giao thông):**")
-    if l_state == "RED":
-        st.markdown('<span class="badge-red">🔴 TRẠNG THÁI: ĐÈN ĐỎ (RED LIGHT) - KÍCH HOẠT GIÁM SÁT VI PHẠM</span>', unsafe_allow_html=True)
-    else:
-        st.markdown('<span class="badge-green">🟢 TRẠNG THÁI: ĐÈN XANH (GREEN LIGHT) - CHO PHÉP PHƯƠNG TIỆN DI CHUYỂN</span>', unsafe_allow_html=True)
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    col_f1, col_f2 = st.columns(2)
-    with col_f1:
-        st.image(f1_img, channels="BGR", caption="Khung hình t (Frame 1) - Mô hình B định vị xe", width="stretch")
-    with col_f2:
-        st.image(f2_img, channels="BGR", caption="Khung hình t+1 (Frame 2) - Mô hình C ghép cặp & Kiểm tra vạch", width="stretch")
-
+    st.markdown(f"<div style='margin:14px 0 10px'>Kết quả Mô hình A &nbsp; {pill(l_state)}</div>", unsafe_allow_html=True)
+    s1, s2 = st.columns(2, gap="large")
+    with s1:
+        with st.container(border=True):
+            st.markdown("**Khung hình t** · Mô hình B định vị xe")
+            st.image(f1_img, channels="BGR", width="stretch")
+    with s2:
+        with st.container(border=True):
+            st.markdown("**Khung hình t+1** · Mô hình C ghép cặp & kiểm tra vạch")
+            st.image(f2_img, channels="BGR", width="stretch")
     if sim_violations:
         for viol in sim_violations:
-            st.markdown(f"""<div class="alert-violation">🚨 CẢNH BÁO VI PHẠM (mô phỏng): Phương tiện {viol['MaXe']} ({viol['LoaiXe']})
-                đã di chuyển cắt qua Vạch Dừng khi Đèn Đỏ!</div>""", unsafe_allow_html=True)
+            banner(f"{viol['MaXe']} ({viol['LoaiXe']}) cắt qua vạch dừng khi đèn đỏ.", good=False)
     else:
-        st.success("✅ Tất cả phương tiện tuân thủ đúng luật giao thông hoặc Đèn Xanh được phép di chuyển.")
+        banner("Tất cả phương tiện chấp hành đúng (dừng trước vạch hoặc đèn xanh).", good=True)
+    st.caption("Đây là cảnh dựng sẵn để minh hoạ quy trình. Để kiểm tra dữ liệu thật, dùng tab “Phân tích ảnh / video”.")
 
-# ------------------------------------------
-# TAB 3: SO SÁNH HIỆU NĂNG MÔ HÌNH
-# ------------------------------------------
+# ==========================================
+# TAB 3: HIỆU NĂNG MÔ HÌNH
+# ==========================================
 with tab_bench:
-    st.subheader("📊 Chi tiết thông số Mô hình Machine Learning được chọn")
-    col_m1, col_m2 = st.columns(2)
-    with col_m1:
-        st.markdown("#### So sánh Độ chính xác (%) giữa các Thuật toán")
-        df_b = pd.DataFrame([
-            {"Thuật toán": k, "Accuracy (%)": v["accuracy"], "Latency (ms)": float(v["latency"].split()[0])}
-            for k, v in MODEL_PERFORMANCE["Model_B"].items()
-        ])
-        fig_bar = px.bar(df_b, x="Thuật toán", y="Accuracy (%)", text="Accuracy (%)", color="Thuật toán",
-                         title="Hiệu năng các thuật toán ở Mô hình B (Phát hiện Xe)",
-                         color_discrete_sequence=px.colors.qualitative.Bold)
-        fig_bar.update_traces(texttemplate="%{text}%", textposition="outside")
-        fig_bar.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="white")
-        st.plotly_chart(fig_bar, width="stretch")
-    with col_m2:
-        st.markdown("#### Bảng Tổng Hợp Chi Tiết Mô Hình Đang Chọn")
-        st.table(pd.DataFrame([
-            {"Mô hình": "Mô hình A (Màu đèn)", "Thuật toán chọn": sel_model_a, "Accuracy": f"{perf_a['accuracy']}%", "Latency": perf_a["latency"], "Mô tả": perf_a["desc"]},
-            {"Mô hình": "Mô hình B (Phát hiện xe)", "Thuật toán chọn": sel_model_b, "Accuracy": f"{perf_b['accuracy']}%", "Latency": perf_b["latency"], "Mô tả": perf_b["desc"]},
-            {"Mô hình": "Mô hình C (Ghép xe)", "Thuật toán chọn": sel_model_c, "Accuracy": f"{perf_c['accuracy']}%", "Latency": perf_c["latency"], "Mô tả": perf_c["desc"]},
-        ]))
+    from plotly.subplots import make_subplots
+    groups = [("Model_A", "A · Nhận diện đèn", sel_model_a), ("Model_B", "B · Phát hiện xe", sel_model_b),
+              ("Model_C", "C · Ghép cặp xe", sel_model_c)]
+    st.write("")
+    fig_b = make_subplots(rows=1, cols=3, subplot_titles=[g[1] for g in groups], shared_yaxes=True,
+                          horizontal_spacing=0.04)
+    for i, (key, _, sel) in enumerate(groups, start=1):
+        names = list(MODEL_PERFORMANCE[key])
+        accs = [MODEL_PERFORMANCE[key][n]["accuracy"] for n in names]
+        fig_b.add_trace(go.Bar(
+            x=[n.replace(" ", "<br>", 1) for n in names], y=accs, text=[f"{a}%" for a in accs], textposition="outside",
+            marker=dict(color=[C_ACCENT if n == sel else "#2A3A5C" for n in names]),
+            hovertemplate="%{x}: %{y}%<extra></extra>", showlegend=False,
+        ), row=1, col=i)
+    fig_b.update_yaxes(range=[80, 101.5], title_text="Accuracy (%)", row=1, col=1)
+    fig_b.update_xaxes(tickangle=0, tickfont=dict(size=11))
+    style_fig(fig_b, height=400)
+    fig_b.update_layout(margin=dict(l=8, r=8, t=56, b=8))
+    fig_b.update_annotations(font=dict(size=13, color=C_MUTED))
+    with st.container(border=True):
+        st.markdown("**Độ chính xác các thuật toán** · cột sáng màu = thuật toán đang chọn ở thanh bên")
+        st.plotly_chart(fig_b, width="stretch", config={"displayModeBar": False})
 
-# ------------------------------------------
-# TAB 4: GIẢI MÃ ĐẶC TRƯNG (HSV & HOG) – lấy từ dữ liệu thật nếu đã phân tích
-# ------------------------------------------
+    with st.container(border=True):
+        st.markdown("**Bộ mô hình đang chọn**")
+        st.dataframe(pd.DataFrame([
+            {"Mô hình": g[1], "Thuật toán": g[2], "Accuracy": p["accuracy"], "F1": p["f1"],
+             "Độ trễ (ms)": float(p["latency"].split()[0]), "Mô tả": p["desc"]}
+            for g, p in zip(groups, (perf_a, perf_b, perf_c))
+        ]), hide_index=True, width="stretch", column_config={
+            "Accuracy": st.column_config.ProgressColumn("Accuracy", format="%.1f%%", min_value=0, max_value=100),
+            "F1": st.column_config.NumberColumn("F1", format="%.2f"),
+            "Độ trễ (ms)": st.column_config.NumberColumn("Độ trễ", format="%.1f ms"),
+            "Mô tả": st.column_config.TextColumn("Mô tả", width="large"),
+        })
+
+# ==========================================
+# TAB 4: ĐẶC TRƯNG HSV & HOG
+# ==========================================
 with tab_feat:
-    st.subheader("🎨 Trực quan hóa đặc trưng trích xuất (Feature Extraction)")
     res = st.session_state.analysis
     light_sample = res.get("light_sample") if res else None
     vehicle_sample = res["vehicle_sample"][0] if res and res.get("vehicle_sample") else None
+    st.write("")
     if res is None:
-        st.info("Đang hiển thị dữ liệu giả lập. Hãy phân tích một ảnh/video ở tab đầu tiên để xem đặc trưng thật.")
+        st.caption("Đang hiển thị dữ liệu minh hoạ. Hãy phân tích một video ở tab đầu để xem đặc trưng lấy từ dữ liệu thật.")
+    else:
+        st.caption("Đặc trưng được trích từ dữ liệu bạn vừa phân tích.")
 
-    col_hsv, col_hog = st.columns(2)
+    col_hsv, col_hog = st.columns(2, gap="large")
     with col_hsv:
-        st.markdown("#### 1. Vector đặc trưng HSV của vùng đèn (44 chiều)")
-        if light_sample is None:
-            light_sample = np.zeros((80, 80, 3), dtype=np.uint8)
-            cv2.circle(light_sample, (40, 40), 22, (0, 0, 230), -1)
-        st.image(light_sample, channels="BGR", caption="Vùng đèn giao thông cắt được (ROI)", width=140)
-        feat = hsv_feature(light_sample)
-        names = ["Hue"] * 18 + ["Saturation"] * 16 + ["Value"] * 10
-        fig_hsv = px.bar(x=list(range(44)), y=feat, color=names,
-                         labels={"x": "Bin HSV (0-43)", "y": "Tỉ lệ điểm ảnh", "color": "Kênh"},
-                         title="Histogram HSV: Hue 18 bin + Saturation 16 bin + Value 10 bin",
-                         color_discrete_map={"Hue": "#ef4444", "Saturation": "#f59e0b", "Value": "#3b82f6"})
-        fig_hsv.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="white")
-        st.plotly_chart(fig_hsv, width="stretch")
+        with st.container(border=True):
+            st.markdown("**Mô hình A · Vector màu HSV của vùng đèn (44 chiều)**")
+            if light_sample is None:
+                light_sample = np.full((90, 60, 3), 20, dtype=np.uint8)
+                cv2.circle(light_sample, (30, 22), 12, (0, 0, 235), -1)
+            hs1, hs2 = st.columns([1, 3])
+            hs1.image(light_sample, channels="BGR", caption="Vùng đèn", width="stretch")
+            state_s, scores = classify_light(light_sample)
+            hs2.markdown(f"Kết luận &nbsp; {pill(state_s)}", unsafe_allow_html=True)
+            hs2.caption(" · ".join(f"{STATE_VN[k]}: {v * 100:.1f}% điểm ảnh" for k, v in scores.items()))
+            feat = hsv_feature(light_sample)
+            fig_hsv = px.bar(x=list(range(44)), y=feat, color=["Hue"] * 18 + ["Saturation"] * 16 + ["Value"] * 10,
+                             labels={"x": "Bin", "y": "Tỉ lệ điểm ảnh", "color": ""},
+                             color_discrete_map={"Hue": C_RED, "Saturation": C_AMBER, "Value": C_ACCENT})
+            fig_hsv.update_layout(legend=dict(orientation="h", y=1.12, x=0))
+            st.plotly_chart(style_fig(fig_hsv, height=300), width="stretch", config={"displayModeBar": False})
 
     with col_hog:
-        st.markdown("#### 2. Đặc trưng HOG của phương tiện")
-        if vehicle_sample is None or vehicle_sample.size == 0:
-            vehicle_sample, _, _ = generate_traffic_scene("Kịch bản 1: Đèn Đỏ - Xe máy Vượt Vạch (Vi Phạm)", 1)
-            vehicle_sample = vehicle_sample[200:300, 330:470]
-        gray = cv2.cvtColor(cv2.resize(vehicle_sample, (128, 128)), cv2.COLOR_BGR2GRAY)
-        hog_vec, hog_img = hog(gray, orientations=9, pixels_per_cell=(8, 8), cells_per_block=(2, 2), visualize=True)
-        hog_img = cv2.normalize(hog_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        h1, h2 = st.columns(2)
-        h1.image(vehicle_sample, channels="BGR", caption="Phương tiện cắt được", width="stretch")
-        h2.image(hog_img, caption="Ảnh HOG (hướng gradient)", width="stretch")
-        st.caption(f"Vector HOG: {hog_vec.size} chiều (ảnh 128×128, 9 hướng, cell 8×8, block 2×2).")
-        fig_hog = px.bar(x=list(range(50)), y=hog_vec[:50], labels={"x": "Chỉ số đặc trưng (50 giá trị đầu)", "y": "Giá trị"},
-                         title="50 giá trị đầu của vector HOG", color_discrete_sequence=["#8b5cf6"])
-        fig_hog.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="white", height=280)
-        st.plotly_chart(fig_hog, width="stretch")
+        with st.container(border=True):
+            st.markdown("**Mô hình B · Đặc trưng HOG của phương tiện**")
+            if vehicle_sample is None or vehicle_sample.size == 0:
+                demo, _, _ = generate_traffic_scene("Kịch bản 1: Đèn Đỏ - Xe máy Vượt Vạch (Vi Phạm)", 1)
+                vehicle_sample = demo[195:300, 335:465]
+            veh_sq = cv2.resize(vehicle_sample, (128, 128))
+            gray = cv2.cvtColor(veh_sq, cv2.COLOR_BGR2GRAY)
+            hog_vec, hog_img = hog(gray, orientations=9, pixels_per_cell=(8, 8), cells_per_block=(2, 2), visualize=True)
+            hog_img = np.sqrt(hog_img / max(hog_img.max(), 1e-6))  # làm rõ các nét gradient yếu
+            hog_img = cv2.resize((hog_img * 255).astype(np.uint8), (256, 256), interpolation=cv2.INTER_NEAREST)
+            hog_img = cv2.applyColorMap(hog_img, cv2.COLORMAP_INFERNO)
+            g1, g2 = st.columns(2)
+            g1.image(cv2.resize(veh_sq, (256, 256)), channels="BGR", caption="Phương tiện (chuẩn hoá 128×128)", width="stretch")
+            g2.image(hog_img, channels="BGR", caption="Hướng gradient (HOG)", width="stretch")
+            fig_hog = px.bar(x=list(range(60)), y=hog_vec[:60], labels={"x": "Chỉ số đặc trưng", "y": "Giá trị"},
+                             color_discrete_sequence=["#A78BFA"])
+            st.plotly_chart(style_fig(fig_hog, height=220), width="stretch", config={"displayModeBar": False})
+            st.caption(f"Vector HOG có {hog_vec.size:,} chiều (ảnh 128×128, 9 hướng, cell 8×8, block 2×2); biểu đồ hiển thị 60 giá trị đầu.")
 
-# ------------------------------------------
+# ==========================================
 # TAB 5: NHẬT KÝ VI PHẠM
-# ------------------------------------------
+# ==========================================
 with tab_log:
-    st.subheader("📋 Bảng Ghi Nhận Phương Tiện Vi Phạm Vượt Đèn Đỏ")
+    st.write("")
     if st.session_state.violations_log:
         df_log = pd.DataFrame(st.session_state.violations_log)
-        st.dataframe(df_log, width="stretch")
-        col_dl1, col_dl2 = st.columns([1, 3])
-        with col_dl1:
-            st.download_button("📥 Tải Nhật Ký Vi Phạm (CSV)", df_log.to_csv(index=False).encode("utf-8-sig"),
-                               file_name="danh_sach_vi_pham_dendo.csv", mime="text/csv")
-        with col_dl2:
-            if st.button("🗑️ Xóa lịch sử ghi nhận"):
+        with st.container(border=True):
+            st.markdown(f"**{len(df_log)} lượt vi phạm** đã ghi nhận trong phiên này")
+            st.dataframe(df_log, hide_index=True, width="stretch")
+            l1, l2, _ = st.columns([1, 1, 2])
+            l1.download_button("⬇  Tải nhật ký (.csv)", df_log.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="danh_sach_vi_pham_dendo.csv", mime="text/csv", width="stretch")
+            if l2.button("Xoá lịch sử", width="stretch"):
                 st.session_state.violations_log = []
                 st.rerun()
     else:
-        st.info("Chưa có lượt vi phạm nào. Hãy tải video/ảnh ở tab đầu tiên và bấm 'Phân tích vi phạm'.")
+        st.markdown("""
+        <div class="empty"><div class="big">📋</div><h4>Chưa có lượt vi phạm nào</h4>
+        <p>Phân tích một video ở tab đầu tiên. Mỗi phương tiện vượt đèn đỏ sẽ được ghi vào đây và có thể tải về dạng CSV.</p></div>
+        """, unsafe_allow_html=True)
 
-st.markdown("---")
-st.markdown("<p style='text-align: center; color: #64748b;'>Đồ án môn Học Máy Truyền Thống © 2026 - Nhóm 6 | Xây dựng với Streamlit & OpenCV</p>", unsafe_allow_html=True)
+st.markdown('<div class="footer">Đồ án môn Học Máy Truyền Thống © 2026 · Nhóm 6 · Streamlit & OpenCV</div>',
+            unsafe_allow_html=True)

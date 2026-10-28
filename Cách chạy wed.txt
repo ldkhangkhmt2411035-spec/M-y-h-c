@@ -1,5 +1,0 @@
-Cách chạy wed 
-#TẢI requirements
-pip install -r requirements.txt
-#Chạy wed bằng terminal 
-streamlit run app.py

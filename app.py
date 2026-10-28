@@ -340,7 +340,31 @@ def classify_light(roi_bgr):
     total = float(H.size)
     scores = {k: float(m.sum()) / total for k, m in masks.items()}
     best = max(scores, key=scores.get)
-    return (best if scores[best] >= 0.004 else "UNKNOWN"), scores
+    h_, w_ = H.shape
+    if scores[best] >= 0.004 and best != "GREEN" and h_ >= 1.8 * w_:
+        # Khung ôm cả hộp đèn DỌC: đèn vàng ngoài đời có màu cam, sắc độ sát với đỏ ⇒ dùng VỊ TRÍ bóng sáng
+        # (trên = đỏ, giữa = vàng) để phân biệt. Màu xanh thì không nhầm nên giữ theo màu.
+        warm = masks["RED"] | masks["YELLOW"]
+        ys = np.nonzero(warm)[0]
+        if ys.size:
+            pos = float(np.median(ys)) / h_
+            return ("RED" if pos < 0.36 else "YELLOW" if pos < 0.64 else best), scores
+    if scores[best] >= 0.004:
+        return best, scores
+    # Không rõ màu (bóng cháy sáng thành trắng): khung ôm cả hộp đèn ⇒ suy ra theo VỊ TRÍ bóng đang sáng.
+    # Đèn dọc: trên = đỏ, giữa = vàng, dưới = xanh. Đèn ngang: trái = đỏ, giữa = vàng, phải = xanh.
+    h, w = V.shape
+    if max(h, w) >= 1.8 * min(h, w) and min(h, w) >= 4:
+        bright = V >= 225
+        axis_len = h if h >= w else w
+        parts = [bright[i * axis_len // 3:(i + 1) * axis_len // 3] if h >= w else
+                 bright[:, i * axis_len // 3:(i + 1) * axis_len // 3] for i in range(3)]
+        counts = [int(p.sum()) for p in parts]
+        k = int(np.argmax(counts))
+        others = sorted(counts)[1]
+        if counts[k] >= 0.01 * total and counts[k] >= 2 * max(others, 1):
+            return ["RED", "YELLOW", "GREEN"][k], scores
+    return "UNKNOWN", scores
 
 
 class LightTracker:
@@ -425,7 +449,7 @@ def detect_by_background(frame, background, min_area, sensitivity, ignore_rect=N
     return boxes, ratio
 
 
-def snap_light_roi(frame, px, py):
+def snap_light_roi(frame, px, py, layout="auto"):
     """Người dùng bấm vào đèn → tìm đốm sáng màu (đỏ/vàng/xanh) gần điểm bấm nhất và ôm khung quanh nó.
 
     Trả về (x, y, rộng, cao) theo % khung hình.
@@ -437,28 +461,125 @@ def snap_light_roi(frame, px, py):
     Hh, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
     colored = (S >= 90) & (V >= 140) & ((Hh <= 14) | (Hh >= 160) | ((Hh >= 15) & (Hh <= 95)))
     overexposed = (V >= 235) & (S < 80)  # tâm bóng đèn bị cháy sáng thành màu trắng
-    lit = (colored | overexposed).astype(np.uint8)
-    n, _, stats, cents = cv2.connectedComponentsWithStats(lit, 8)
     best = None
-    for k in range(1, n):
-        bw_, bh_ = stats[k, cv2.CC_STAT_WIDTH], stats[k, cv2.CC_STAT_HEIGHT]
-        # đèn là một đốm sáng nhỏ, gọn: bỏ qua mảng lớn như cây xanh, bầu trời, thân xe
-        if stats[k, cv2.CC_STAT_AREA] < 6 or bw_ > 0.12 * W or bh_ > 0.14 * H:
-            continue
-        bx_, by_ = stats[k, cv2.CC_STAT_LEFT] + x0, stats[k, cv2.CC_STAT_TOP] + y0
-        # khoảng cách từ điểm bấm tới khung của đốm sáng (= 0 nếu bấm trúng bên trong)
-        d = np.hypot(max(bx_ - px, 0, px - (bx_ + bw_)), max(by_ - py, 0, py - (by_ + bh_)))
-        if best is None or d < best[0]:
-            best = (d, k)
-    if best is not None and best[0] <= 0.025 * W:
-        bx, by, bw, bh = stats[best[1], :4]
-        cx, cy = bx + x0 + bw / 2, by + y0 + bh / 2
-        half_w, half_h = max(bw * 1.3, 0.015 * W), max(bh * 1.3, 0.015 * H)
-    else:
+    # xét riêng đốm có màu và đốm cháy trắng (để vùng trời trắng không dính vào bóng đèn)
+    for mask in (colored, overexposed, colored | overexposed):
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+        for k in range(1, n):
+            bw_, bh_ = stats[k, cv2.CC_STAT_WIDTH], stats[k, cv2.CC_STAT_HEIGHT]
+            # đèn là một đốm sáng nhỏ, gọn: bỏ qua mảng lớn như cây xanh, bầu trời, thân xe
+            if stats[k, cv2.CC_STAT_AREA] < 6 or bw_ > 0.12 * W or bh_ > 0.14 * H:
+                continue
+            bx_, by_ = stats[k, cv2.CC_STAT_LEFT] + x0, stats[k, cv2.CC_STAT_TOP] + y0
+            # khoảng cách từ điểm bấm tới khung của đốm sáng (= 0 nếu bấm trúng bên trong)
+            d = np.hypot(max(bx_ - px, 0, px - (bx_ + bw_)), max(by_ - py, 0, py - (by_ + bh_)))
+            # ưu tiên đốm gần điểm bấm nhất; bằng nhau thì lấy đốm nhỏ hơn (tâm bóng đèn, không phải quầng sáng)
+            key_ = (round(d / max(2.0, 0.01 * W)), stats[k, cv2.CC_STAT_AREA])
+            if best is None or key_ < best[2]:
+                best = (d, (bx_, by_, int(bw_), int(bh_)), key_)
+    if best is None or best[0] > 0.025 * W:
         return None  # chỗ bấm không có đốm đèn sáng nào
-    rx0, ry0 = max(0.0, (cx - half_w) / W * 100), max(0.0, (cy - half_h) / H * 100)
-    rx1, ry1 = min(100.0, (cx + half_w) / W * 100), min(100.0, (cy + half_h) / H * 100)
+    lamp = best[1]
+    bw, bh = lamp[2], lamp[3]
+    lamp_color, _ = classify_light(frame[lamp[1]:lamp[1] + bh, lamp[0]:lamp[0] + bw])
+    if layout == "lamp":  # chỉ ôm bóng đèn đang sáng
+        d_ = max(bw, bh)
+        hx0, hy0, hx1, hy1 = lamp[0] - 0.4 * d_, lamp[1] - 0.4 * d_, lamp[0] + bw + 0.4 * d_, lamp[1] + bh + 0.4 * d_
+    else:
+        hx0, hy0, hx1, hy1 = expand_to_housing(frame, lamp, lamp_color,
+                                               {"auto": None, "vertical": True, "horizontal": False}[layout])
+    pad_x, pad_y = 0.08 * (hx1 - hx0), 0.05 * (hy1 - hy0)
+    rx0, ry0 = max(0.0, (hx0 - pad_x) / W * 100), max(0.0, (hy0 - pad_y) / H * 100)
+    rx1, ry1 = min(100.0, (hx1 + pad_x) / W * 100), min(100.0, (hy1 + pad_y) / H * 100)
     return int(rx0), int(ry0), max(1, int(np.ceil(rx1 - int(rx0)))), max(1, int(np.ceil(ry1 - int(ry0))))
+
+
+def expand_to_housing(frame, lamp, lamp_color, force_vertical=None):
+    """Từ bóng đèn đang sáng, mở rộng khung ra cả hộp đèn 3 bóng.
+
+    Hộp đèn có hình học cố định: 3 bóng cách đều nhau, dọc (đỏ trên – vàng giữa – xanh dưới) hoặc
+    ngang (đỏ trái – vàng giữa – xanh phải). Tạo các khung ứng viên theo hình học đó rồi chọn khung có
+    phần vỏ màu tối nhiều nhất. Trả về (x0, y0, x1, y1) theo pixel.
+    """
+    H, W = frame.shape[:2]
+    lx, ly, lw, lh = lamp
+    cx, cy = lx + lw / 2, ly + lh / 2
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    V = hsv[..., 2]
+    # đường kính bóng: cạnh ngắn của đốm (đốm có thể dính số đếm ngược); tâm cháy trắng nhỏ hơn bóng thật
+    d = float(max(min(lw, lh) if max(lw, lh) > 1.5 * min(lw, lh) else max(lw, lh), 4))
+    core = frame[ly:ly + lh, lx:lx + lw]
+    if core.size and float(np.mean(cv2.cvtColor(core, cv2.COLOR_BGR2HSV)[..., 1])) < 80:
+        d *= 1.35
+    pitch = 1.3 * d
+    nb = V[max(0, int(cy - 5 * d)):int(cy + 5 * d), max(0, int(cx - 5 * d)):int(cx + 5 * d)]
+    # độ tối TƯƠNG ĐỐI so với cảnh xung quanh (trời mưa / sương mù thì vỏ đèn chỉ xám chứ không đen)
+    ref = max(60.0, float(np.percentile(nb, 75))) if nb.size else 160.0
+    dark = np.clip((ref - V.astype(np.float32)) / ref, 0.0, 1.0)
+    lamp_slot = {"RED": [0], "YELLOW": [1], "GREEN": [2]}.get(lamp_color, [0, 1, 2])
+
+    # Quầng màu quanh bóng (gồm cả số đếm ngược cùng màu đặt cạnh bóng) cho biết hộp đèn nằm ngang hay dọc
+    S_, H_ = hsv[..., 1], hsv[..., 0]
+    colored = ((S_ >= 90) & (V >= 140)).astype(np.uint8)
+    r_ = int(3 * d)
+    wx0, wy0 = max(0, int(cx) - r_), max(0, int(cy) - r_)
+    win = colored[wy0:int(cy) + r_, wx0:int(cx) + r_]
+    halo = None
+    if win.size:
+        n_, lab_, st_, _ = cv2.connectedComponentsWithStats(win, 8)
+        k_ = lab_[min(win.shape[0] - 1, int(cy) - wy0), min(win.shape[1] - 1, int(cx) - wx0)]
+        if k_ == 0 and n_ > 1:  # tâm cháy trắng: lấy quầng màu gần nhất
+            dists = [np.hypot(st_[j, 0] + st_[j, 2] / 2 - (cx - wx0), st_[j, 1] + st_[j, 3] / 2 - (cy - wy0))
+                     for j in range(1, n_)]
+            k_ = 1 + int(np.argmin(dists)) if min(dists) < 1.5 * d else 0
+        if k_ > 0:
+            hx, hy, hw, hh = st_[k_, :4]
+            halo = (hx + wx0, hy + wy0, hw, hh)
+    layout_bonus = {True: 0.03, False: 0.0}  # đèn dọc phổ biến hơn ⇒ ưu tiên nhẹ
+    if halo is not None and halo[2] >= 1.8 * halo[3]:
+        layout_bonus = {True: 0.0, False: 0.12}
+    elif halo is not None and halo[3] >= 1.8 * halo[2]:
+        layout_bonus = {True: 0.12, False: 0.0}
+
+    best = None
+    for vertical in ((True, False) if force_vertical is None else (force_vertical,)):
+        for slot in lamp_slot:
+            # bóng đang sáng nằm ở vị trí `slot` (0, 1, 2) trong hộp
+            start = -slot * pitch - 0.62 * pitch
+            end = (2 - slot) * pitch + 0.62 * pitch
+            if vertical:
+                x0, x1, y0, y1 = cx - 0.62 * pitch, cx + 0.62 * pitch, cy + start, cy + end
+            else:
+                x0, x1, y0, y1 = cx + start, cx + end, cy - 0.62 * pitch, cy + 0.62 * pitch
+            X0, Y0, X1, Y1 = max(0, int(x0)), max(0, int(y0)), min(W, int(np.ceil(x1))), min(H, int(np.ceil(y1)))
+            if X1 - X0 < 3 or Y1 - Y0 < 3:
+                continue
+            region = dark[Y0:Y1, X0:X1].copy()
+            # bỏ phần bóng đang sáng khỏi phép đo độ tối
+            region[max(0, ly - Y0):max(0, ly + lh - Y0), max(0, lx - X0):max(0, lx + lw - X0)] = np.nan
+            inner = float(np.nanmean(region)) if np.isfinite(region).any() else 0.0
+            # dải nền chạy dọc hai bên cạnh dài của hộp: vỏ đèn phải tối hơn hẳn nền xung quanh nó
+            s = max(2, int(0.5 * pitch))
+            if vertical:
+                sides = [dark[Y0:Y1, max(0, X0 - s):X0], dark[Y0:Y1, X1:min(W, X1 + s)]]
+            else:
+                sides = [dark[max(0, Y0 - s):Y0, X0:X1], dark[Y1:min(H, Y1 + s), X0:X1]]
+            sides = [z for z in sides if z.size]
+            outer = float(np.mean([z.mean() for z in sides])) if sides else 0.5
+            score = inner - outer
+            # phần hộp bị cắt bởi mép ảnh thì kém tin cậy
+            inside = (X1 - X0) * (Y1 - Y0) / max(1.0, (x1 - x0) * (y1 - y0))
+            score *= inside
+            score += layout_bonus[vertical]
+            if best is None or score > best[0]:
+                best = (score, (X0, Y0, X1, Y1))
+    if best is None:
+        return int(cx - d), int(cy - d), int(cx + d), int(cy + d)
+    X0, Y0, X1, Y1 = best[1]
+    if halo is not None and halo[2] * halo[3] < 9 * d * d:  # gộp cả số đếm ngược vào khung
+        X0, Y0 = min(X0, halo[0]), min(Y0, halo[1])
+        X1, Y1 = max(X1, halo[0] + halo[2]), max(Y1, halo[1] + halo[3])
+    return X0, Y0, X1, Y1
 
 
 def merge_fragments(boxes, W, H, max_area=None):
@@ -1321,6 +1442,11 @@ with tab_real:
                     "Công cụ bấm trên ảnh", ["🚦 Chọn đèn", "📏 Vẽ vạch dừng"], default="🚦 Chọn đèn", key="tool",
                 ) or "🚦 Chọn đèn"
                 if tool == "🚦 Chọn đèn":
+                    layout_opts = {"auto": "Tự động", "vertical": "Dọc", "horizontal": "Ngang", "lamp": "Chỉ bóng"}
+                    st.segmented_control("Kiểu hộp đèn", list(layout_opts), format_func=layout_opts.get,
+                                         default="auto", key="light_layout",
+                                         help="Khung tự ôm cả hộp đèn 3 bóng. Nếu đoán sai kiểu đèn (dọc/ngang), chọn lại "
+                                              "ở đây — khung tự tính lại, không cần bấm lại vào đèn.")
                     st.markdown(
                         "Bấm vào **đèn tròn điều khiển làn xe cần giám sát**. Hệ thống tự ôm khung quanh đèn.  \n"
                         f"<span style='color:{C_AMBER}'>Không chọn đèn mũi tên rẽ phải/trái</span> nếu làn đó có đèn riêng.",
@@ -1419,7 +1545,9 @@ with tab_real:
                     cx = int(click["x"] * Wp / max(click["width"], 1))
                     cy = int(click["y"] * Hp / max(click["height"], 1))
                     if tool == "🚦 Chọn đèn":
-                        snapped = snap_light_roi(preview, cx, cy)
+                        st.session_state.last_lamp_click = (source_key, cx, cy)
+                        snapped = snap_light_roi(preview, cx, cy, st.session_state.get("light_layout") or "auto")
+                        st.session_state.layout_applied = (source_key, st.session_state.get("light_layout") or "auto")
                         if snapped is None:
                             st.session_state.light_miss = source_key
                         else:
@@ -1446,6 +1574,17 @@ with tab_real:
                     banner("<b>Chưa chọn đèn.</b> Chọn công cụ 🚦 rồi bấm lên ảnh, vào đúng <b>đèn tròn</b> điều khiển "
                            "làn xe cần giám sát (không phải đèn mũi tên rẽ). Nếu video không quay được đèn, chọn "
                            "“coi như luôn đỏ” ở mục Trạng thái đèn.", good="warn")
+                cur_layout = st.session_state.get("light_layout") or "auto"
+                lc = st.session_state.get("last_lamp_click")
+                if (lc and lc[0] == source_key and light_ok and light_mode == "auto"
+                        and st.session_state.get("layout_applied") != (source_key, cur_layout)):
+                    st.session_state.layout_applied = (source_key, cur_layout)
+                    snapped = snap_light_roi(preview, lc[1], lc[2], cur_layout)
+                    if snapped is not None:
+                        nrx, nry, nrw, nrh = snapped
+                        st.session_state.pending_cfg = dict(rx=min(nrx, 99), ry=min(nry, 99), rw=min(max(nrw, 1), 50),
+                                                            rh=min(max(nrh, 1), 60))
+                        st.rerun()
                 z1, z2 = st.columns([1, 4], vertical_alignment="center")
                 if light_ok and light_mode == "auto" and light_roi_img.size:
                     zoom = cv2.resize(light_roi_img, (96, max(1, int(96 * light_roi_img.shape[0] / max(light_roi_img.shape[1], 1)))),

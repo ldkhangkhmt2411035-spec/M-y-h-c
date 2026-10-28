@@ -89,6 +89,9 @@ st.markdown("""
     box-shadow: 0 6px 20px rgba(14,165,233,0.25); font-weight: 700;
 }
 .stButton > button[kind="primary"]:hover { filter: brightness(1.08); color: #04121F; }
+.stButton > button:disabled, .stButton > button[kind="primary"]:disabled {
+    background: #16213A; color: #64748B; box-shadow: none; border: 1px dashed #2A3A5C; cursor: not-allowed;
+}
 
 /* ---------- Ô tải file ---------- */
 [data-testid="stFileUploaderDropzone"] {
@@ -350,6 +353,12 @@ class LightTracker:
         state, _ = classify_light(roi_bgr)
         if state != "UNKNOWN":
             self.hist.append(state)
+            self.n_unknown = 0
+        else:
+            self.n_unknown = getattr(self, "n_unknown", 0) + 1
+            if self.n_unknown > 3 * self.hist.maxlen:  # lâu không thấy đèn sáng ⇒ không còn biết đèn màu gì
+                self.hist.clear()
+                self.last = "UNKNOWN"
         if self.hist:
             self.last = Counter(self.hist).most_common(1)[0][0]
         return self.last
@@ -476,7 +485,7 @@ class VehicleTracker:
                     del self.tracks[tid]
         for j, b in enumerate(boxes):
             if j not in used_d:
-                self.tracks[self.next_id] = dict(box=b, c=cents[j], missed=0, age=1,
+                self.tracks[self.next_id] = dict(box=b, c=cents[j], c0=cents[j], missed=0, age=1, moved=False,
                                                  seen_before=False, done=False, violation=False)
                 self.next_id += 1
         return {tid: t for tid, t in self.tracks.items() if t["missed"] == 0}
@@ -486,19 +495,20 @@ def vehicle_type(box, frame_area, car_area_pct):
     return "Ô tô" if box[2] * box[3] / frame_area * 100 >= car_area_pct else "Xe máy"
 
 
-def draw_overlay(frame, line, light_rect, light_state, active, info_text):
+def draw_overlay(frame, line, light_rect, light_state, active, info_text, show_light=True):
     img = frame.copy()
     p1, p2 = line.pts()
     line_color = BGR_RED if light_state == "RED" else BGR_YELLOW
     cv2.line(img, p1, p2, line_color, 3)
     cv2.putText(img, "VACH DUNG", (p1[0] + 5, p1[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, line_color, 2)
-    x0, y0, x1, y1 = light_rect
-    cv2.rectangle(img, (x0, y0), (x1, y1), STATE_COLOR[light_state], 2)
-    lbl = f"DEN {STATE_ASCII[light_state]}"
-    (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-    lx = min(x0, img.shape[1] - tw - 6)
-    ly = y0 - 6 if y0 - 6 >= th + 32 else y1 + th + 6  # tránh đè lên thanh thông tin phía trên
-    cv2.putText(img, lbl, (max(2, lx), ly), cv2.FONT_HERSHEY_SIMPLEX, 0.5, STATE_COLOR[light_state], 2)
+    if show_light:
+        x0, y0, x1, y1 = light_rect
+        cv2.rectangle(img, (x0, y0), (x1, y1), STATE_COLOR[light_state], 2)
+        lbl = f"DEN {STATE_ASCII[light_state]}"
+        (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        lx = min(x0, img.shape[1] - tw - 6)
+        ly = y0 - 6 if y0 - 6 >= th + 32 else y1 + th + 6  # tránh đè lên thanh thông tin phía trên
+        cv2.putText(img, lbl, (max(2, lx), ly), cv2.FONT_HERSHEY_SIMPLEX, 0.5, STATE_COLOR[light_state], 2)
     for tid, t in active.items():
         x, y, w, h = t["box"]
         color = BGR_RED if t["violation"] else BGR_GREEN
@@ -533,7 +543,7 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
     frames: iterator trả về (thời_gian_giây, khung_BGR) đã cùng kích thước.
     background: None = video (MOG2); ảnh nền = chế độ ảnh tĩnh.
     """
-    results = dict(violations=[], timeline=[], annotated=[], n_frames=0, crossed_ok=0, skipped=0,
+    results = dict(violations=[], timeline=[], annotated=[], n_frames=0, crossed_ok=0, skipped=0, moving_down=0, moving_up=0,
                    light_sample=None, light_samples={}, vehicle_sample=None, vehicle_ids=set())
     line = light_rect = detector = tracker = None
     lights = LightTracker(cfg["light_mode"])
@@ -598,6 +608,14 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
                 else:
                     results["crossed_ok"] += 1
 
+        # Thống kê hướng di chuyển thực tế của xe (để phát hiện chọn nhầm hướng)
+        for tr in active.values():
+            if not tr["moved"] and line.within(tr["c"], tol=0.1):
+                dyy = tr["c"][1] - tr["c0"][1]
+                if abs(dyy) > 0.08 * H:
+                    tr["moved"] = True
+                    results["moving_down" if dyy > 0 else "moving_up"] += 1
+
         for tid, tr in active.items():
             if tr["age"] >= 2 or single_image:
                 results["vehicle_ids"].add(tid)
@@ -650,40 +668,179 @@ def open_video_writer(path, fps, size):
         return vw.write, vw.release, False
 
 
-def read_first_frame(video_path):
+# ---------- Tiền xử lý video: tách cảnh, bỏ viền đen, đoán hướng xe, phát hiện camera rung/zoom ----------
+def _scene_signature(frame):
+    small = cv2.resize(frame, (64, 64), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 8], [0, 180, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist, cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+
+def content_box(frames):
+    """Vùng hình camera thật (x0, y0, x1, y1): bỏ viền đen và chữ tiêu đề nằm trên viền đen của video dọc."""
+    g = np.median(np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]), axis=0)
+    bright = g > 28
+
+    def longest_run(frac):
+        good = list(frac > 0.55) + [False]
+        best, best_len, cur, start = (0, len(frac)), 0, 0, 0
+        for i, v in enumerate(good):
+            if v:
+                start = i if cur == 0 else start
+                cur += 1
+            else:
+                if cur > best_len:
+                    best_len, best = cur, (start, start + cur)
+                cur = 0
+        return best if best_len > 0.25 * len(frac) else (0, len(frac))
+
+    y0, y1 = longest_run(bright.mean(axis=1))
+    x0, x1 = longest_run(bright[y0:y1].mean(axis=0))
+    # làm tròn chẵn để mã hoá video
+    return x0, y0, x0 + (x1 - x0) // 2 * 2, y0 + (y1 - y0) // 2 * 2
+
+
+def motion_profile(frames):
+    """Optical flow Farneback: (hướng xe 'down'/'up'/None, độ tin cậy, camera có đang di chuyển/zoom không)."""
+    votes, cam = [], []
+    prev = None
+    for f in frames:
+        g = cv2.cvtColor(cv2.resize(f, (320, max(32, int(320 * f.shape[0] / f.shape[1])))), cv2.COLOR_BGR2GRAY)
+        if prev is not None and prev.shape == g.shape:
+            flow = cv2.calcOpticalFlowFarneback(prev, g, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            mag = np.hypot(flow[..., 0], flow[..., 1])
+            cam.append(float(np.median(mag)))  # camera đứng yên ⇒ phần lớn điểm ảnh không chuyển động
+            low = flow[g.shape[0] // 3:]
+            m = np.hypot(low[..., 0], low[..., 1]) > 1.0
+            if m.sum() > 50:
+                votes.append(float(np.median(low[..., 1][m])))
+        prev = g
+    moving_cam = bool(cam) and float(np.median(cam)) > 0.5
+    v = np.array(votes)
+    down, up = int((v > 0.3).sum()), int((v < -0.3).sum())
+    if down + up == 0:
+        return None, 0.0, moving_cam
+    return ("down" if down >= up else "up"), max(down, up) / (down + up), moving_cam
+
+
+@st.cache_data(show_spinner=False, max_entries=6)
+def scan_video_scenes(video_path, file_size, sample_fps=5.0, max_seconds=300):
+    """Đọc lướt video, chia thành các cảnh quay (video tổng hợp thường ghép nhiều camera)."""
     cap = cv2.VideoCapture(video_path)
-    ok, frame = cap.read()
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    if fps <= 1 or fps > 240:
+        fps = 25.0
+    step = max(1, int(round(fps / sample_fps)))
+    samples, idx = [], 0
+    while idx / fps < max_seconds:
+        if not cap.grab():
+            break
+        if idx % step == 0:
+            ok, f = cap.retrieve()
+            if not ok:
+                break
+            scale = min(1.0, 480 / f.shape[1])
+            samples.append((idx / fps, cv2.resize(f, None, fx=scale, fy=scale) if scale < 1 else f))
+        idx += 1
     cap.release()
-    return resize_frame(frame) if ok else None
+    duration = idx / fps
+    if not samples:
+        return dict(fps=fps, duration=0.0, scenes=[])
+    H0, W0 = samples[0][1].shape[:2]
+
+    # 1) Vùng hình chung (bỏ viền đen) để so sánh các khung với nhau
+    gx0, gy0, gx1, gy1 = content_box([f for _, f in samples[:: max(1, len(samples) // 20)]])
+    sigs = [_scene_signature(f[gy0:gy1, gx0:gx1]) for _, f in samples]
+    diffs, corrs = [], []
+    for a, b in zip(sigs, sigs[1:]):
+        corrs.append(cv2.compareHist(a[0], b[0], cv2.HISTCMP_CORREL))
+        diffs.append(float(np.mean(np.abs(a[1] - b[1]))))
+    thr = max(14.0, 4 * float(np.median(diffs))) if diffs else 14.0
+    cuts = [0.0]
+    for k, (d, c) in enumerate(zip(diffs, corrs)):
+        t = samples[k + 1][0]
+        if (d > thr or c < 0.5) and t - cuts[-1] >= 0.8:
+            cuts.append(t)
+    bounds = cuts + [duration]
+
+    scenes = []
+    for i in range(len(cuts)):
+        s, e = bounds[i], bounds[i + 1]
+        fr = [f for t, f in samples if s + 0.25 <= t < e - 0.1] or [f for t, f in samples if s <= t < e]
+        if not fr:
+            continue
+        x0, y0, x1, y1 = content_box(fr[:: max(1, len(fr) // 15)])
+        crop = [f[y0:y1, x0:x1] for f in fr[: 40]]
+        direction, conf, moving = motion_profile(crop)
+        mid = fr[len(fr) // 2][y0:y1, x0:x1]
+        thumb = cv2.resize(mid, (240, max(1, int(240 * mid.shape[0] / mid.shape[1]))))
+        # toạ độ vùng hình theo tỉ lệ (để áp lên khung gốc độ phân giải đầy đủ)
+        box = (x0 / W0, y0 / H0, x1 / W0, y1 / H0)
+        scenes.append(dict(start=s, end=e, box=box, direction=direction, conf=conf, moving=moving, thumb=thumb))
+    return dict(fps=fps, duration=duration, scenes=scenes)
 
 
-def analyze_video(video_path, cfg, progress):
+def crop_rel(frame, box):
+    if box is None:
+        return frame
+    H, W = frame.shape[:2]
+    x0, y0, x1, y1 = int(box[0] * W), int(box[1] * H), int(box[2] * W), int(box[3] * H)
+    x1 = x0 + max(2, (x1 - x0) // 2 * 2)
+    y1 = y0 + max(2, (y1 - y0) // 2 * 2)
+    return frame[y0:y1, x0:x1]
+
+
+def read_frame_at(video_path, t_sec=0.0, box=None):
+    cap = cv2.VideoCapture(video_path)
+    if t_sec > 0:
+        cap.set(cv2.CAP_PROP_POS_MSEC, t_sec * 1000)
+    ok, frame = cap.read()
+    if not ok and t_sec > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ok, frame = cap.read()
+    cap.release()
+    return resize_frame(crop_rel(frame, box)) if ok else None
+
+
+def read_first_frame(video_path):
+    return read_frame_at(video_path, 0.0)
+
+
+def analyze_video(video_path, cfg, progress, start=0.0, end=None, box=None):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     if fps <= 1 or fps > 240:
         fps = 25.0
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     step = max(1, cfg["frame_step"])
-    max_frames = int(fps * cfg["max_seconds"])
-    n_src = min(n_total, max_frames) if n_total > 0 else max_frames
-    n_proc = max(1, n_src // step)
+    start_idx = int(round(start * fps))
+    stop_idx = start_idx + int(fps * cfg["max_seconds"])
+    if end is not None:
+        stop_idx = min(stop_idx, int(round(end * fps)))
+    if n_total > 0:
+        stop_idx = min(stop_idx, n_total)
+    n_proc = max(1, (stop_idx - start_idx) // step)
     fps_eff = fps / step
 
+    if start_idx:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
     ok, first = cap.read()
     if not ok:
         cap.release()
         return None
-    size = (resize_frame(first).shape[1], resize_frame(first).shape[0])
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    first = resize_frame(crop_rel(first, box))
+    size = (first.shape[1], first.shape[0])
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
 
     def gen():
-        idx = 0
-        while idx < max_frames:
+        idx = start_idx
+        while idx < stop_idx:
             ok, f = cap.read()
             if not ok:
                 break
-            if idx % step == 0:
-                yield idx / fps, resize_frame(f, size)
+            if (idx - start_idx) % step == 0:
+                yield idx / fps, resize_frame(crop_rel(f, box), size)
             idx += 1
 
     out_path = os.path.join(tempfile.mkdtemp(), "ket_qua.mp4")
@@ -945,9 +1102,51 @@ with tab_real:
                 st.session_state.use_sample = False
                 st.rerun()
         if video_path:
-            preview = read_first_frame(video_path)
-            if preview is None:
+            with st.spinner("Đang đọc lướt video: tách cảnh quay, bỏ viền đen, ước lượng hướng xe..."):
+                scan = scan_video_scenes(video_path, os.path.getsize(video_path))
+            scenes = scan["scenes"]
+            if not scenes:
                 banner("Không đọc được video này. Hãy chuyển sang định dạng .mp4 (H.264) rồi thử lại.", good=False)
+            else:
+                base_key = source_key
+                scene_idx = 0
+                if len(scenes) > 1:
+                    st.markdown(f"**Video gồm {len(scenes)} cảnh quay khác nhau** · mỗi cảnh là một camera / góc quay "
+                                "riêng nên cần chọn đèn và vạch dừng riêng. Chọn cảnh cần phân tích:")
+                    per_row = 6
+                    for r0 in range(0, len(scenes), per_row):
+                        cols = st.columns(per_row)
+                        for j, sc in enumerate(scenes[r0:r0 + per_row]):
+                            k = r0 + j
+                            flag = " · ⚠ camera chuyển động" if sc["moving"] else ""
+                            cols[j].image(sc["thumb"], channels="BGR", width="stretch",
+                                          caption=f"Cảnh {k + 1} · {sc['start']:.1f}–{sc['end']:.1f}s{flag}")
+                    labels = [f"Cảnh {k + 1}" for k in range(len(scenes))]
+                    pick = st.segmented_control("Cảnh cần phân tích", labels, default=labels[0],
+                                                key=f"scene_pick_{base_key}", label_visibility="collapsed")
+                    scene_idx = labels.index(pick) if pick in labels else 0
+                    source_key = f"{base_key}#canh{scene_idx + 1}"
+                scene = scenes[scene_idx]
+                st.session_state.scene_info = dict(start=scene["start"], end=scene["end"], box=scene["box"],
+                                                   label=f"Cảnh {scene_idx + 1}" if len(scenes) > 1 else "")
+                cut = scene["box"]
+                full = abs(cut[0]) < 0.01 and abs(cut[1]) < 0.01 and cut[2] > 0.99 and cut[3] > 0.99
+                st.session_state.scene_info["box"] = None if full else cut
+                preview = read_frame_at(video_path, scene["start"] + min(0.5, (scene["end"] - scene["start"]) / 3),
+                                        st.session_state.scene_info["box"])
+                if not full:
+                    st.caption("Đã tự cắt bỏ viền đen / chữ tiêu đề quanh hình camera.")
+                if scene["moving"]:
+                    banner("<b>Camera trong cảnh này đang zoom hoặc lia.</b> Phương pháp trừ nền chỉ đúng với camera đứng yên, "
+                           "nên kết quả cảnh này sẽ không đáng tin (xe bị cắt thành nhiều mảnh, báo vi phạm nhầm). "
+                           "Nên chọn cảnh khác.", good="warn")
+                # Hướng xe: tự điền theo ước lượng optical flow cho mỗi cảnh mới (người dùng vẫn đổi được)
+                if scene["direction"] and st.session_state.get("dir_applied_for") != source_key:
+                    st.session_state.direction = "Từ trên xuống ↓" if scene["direction"] == "down" else "Từ dưới lên ↑"
+                    st.session_state.dir_applied_for = source_key
+                st.session_state.dir_guess = (scene["direction"], scene["conf"])
+                if preview is None:
+                    banner("Không đọc được khung hình của cảnh này.", good=False)
     else:
         c_i1, c_i2 = st.columns(2)
         ups = c_i1.file_uploader("Ảnh cần kiểm tra (1 ảnh hoặc nhiều ảnh liên tiếp, cùng góc camera)",
@@ -983,6 +1182,10 @@ with tab_real:
             _, mid, _ = st.columns([2, 1.2, 2])
             if mid.button("▶  Thử với video mẫu", type="primary", width="stretch"):
                 st.session_state.use_sample = True
+                # video mẫu: đèn ở góc phải, vạch dừng ở 65% chiều cao — cấu hình sẵn để demo ngay
+                st.session_state.pending_cfg = dict(rx=87, ry=3, rw=7, rh=30, lx1=5, ly1=65, lx2=95, ly2=65,
+                                                    light_mode="auto")
+                st.session_state.light_confirmed_for = "vid:video_thu.mp4:sample"
                 st.rerun()
         st.write("")
         st.markdown("""
@@ -1001,6 +1204,10 @@ with tab_real:
             st.session_state.setdefault(k_, v_)
         st.session_state.setdefault("light_mode", "auto")
         st.session_state.setdefault("line_first_pt", None)
+        st.session_state.cur_source = source_key
+
+        def _confirm_light():  # người dùng tự kéo thanh trượt vùng đèn ⇒ coi như đã chọn đèn
+            st.session_state.light_confirmed_for = st.session_state.get("cur_source")
         pending = st.session_state.pop("pending_cfg", None)
         if pending:
             for k_, v_ in pending.items():
@@ -1023,9 +1230,16 @@ with tab_real:
                         ("Bấm **điểm thứ hai** (đầu còn lại của vạch dừng)." if first_pt else
                          "Bấm **2 điểm** ở hai đầu vạch dừng.")
                         + "  \nChỉ kéo vạch qua những làn chịu đèn đã chọn; bỏ làn rẽ có đèn mũi tên riêng.")
-                direction_lbl = st.radio("Hướng xe chạy", ["Từ trên xuống ↓", "Từ dưới lên ↑"],
-                                         horizontal=True, key="direction")
+                direction_lbl = st.radio("Hướng xe chạy (của làn chịu đèn đã chọn)", ["Từ trên xuống ↓", "Từ dưới lên ↑"],
+                                         horizontal=True, key="direction",
+                                         help="Thấy đầu xe ⇒ xe chạy về phía camera (thường là từ trên xuống). "
+                                              "Thấy đuôi xe, lưng người lái ⇒ xe chạy ra xa camera (từ dưới lên). "
+                                              "Mặt đèn quay về phía camera thường điều khiển các xe đang đi ra xa camera.")
                 direction = "down" if direction_lbl.startswith("Từ trên") else "up"
+                guess = st.session_state.get("dir_guess") if input_type == "🎥 Video" else None
+                if guess and guess[0]:
+                    g_lbl = "từ trên xuống ↓" if guess[0] == "down" else "từ dưới lên ↑"
+                    st.caption(f"Hệ thống đoán (optical flow): xe chủ yếu chạy **{g_lbl}** · độ tin cậy {guess[1] * 100:.0f}%")
                 light_options = {
                     "auto": "Tự động nhận diện màu đèn",
                     "red": "Không thấy đèn trong hình · coi như luôn đỏ",
@@ -1043,10 +1257,10 @@ with tab_real:
                 ly2 = a2.slider("Đầu 2 · dọc", 0, 100, key="ly2")
                 st.caption("Vùng đèn (% khung hình)")
                 b1, b2 = st.columns(2)
-                rx = b1.slider("Vị trí ngang", 0, 99, key="rx")
-                ry = b1.slider("Vị trí dọc", 0, 99, key="ry")
-                rw = b2.slider("Chiều rộng", 1, 50, key="rw")
-                rh = b2.slider("Chiều cao", 1, 60, key="rh")
+                rx = b1.slider("Vị trí ngang", 0, 99, key="rx", on_change=_confirm_light)
+                ry = b1.slider("Vị trí dọc", 0, 99, key="ry", on_change=_confirm_light)
+                rw = b2.slider("Chiều rộng", 1, 50, key="rw", on_change=_confirm_light)
+                rh = b2.slider("Chiều cao", 1, 60, key="rh", on_change=_confirm_light)
 
             with st.expander("Tinh chỉnh nâng cao"):
                 min_area_pct = st.slider("Diện tích xe nhỏ nhất (% khung hình)", 0.05, 5.0, 0.4, 0.05,
@@ -1063,17 +1277,23 @@ with tab_real:
                    car_area_pct=car_area_pct, sensitivity=sensitivity, frame_step=frame_step,
                    max_seconds=max_seconds)
 
+        light_ok = light_mode != "auto" or st.session_state.get("light_confirmed_for") == source_key
+
         with col_prev:
             Hp, Wp = preview.shape[:2]
             line_prev = StopLine(cfg["line"], preview.shape, direction)
             rect_prev = pct_rect_to_px(cfg["light_roi"], preview.shape)
             x0, y0, x1, y1 = rect_prev
             light_roi_img = preview[y0:y1, x0:x1]
-            if light_mode == "auto":
+            if not light_ok:
+                prev_state = "UNKNOWN"
+            elif light_mode == "auto":
                 prev_state, _ = classify_light(light_roi_img)
             else:
                 prev_state = "RED" if light_mode == "red" else "GREEN"
-            prev_img = draw_overlay(preview, line_prev, rect_prev, prev_state, {}, "Xem truoc")
+            hint = "Xem truoc" if light_ok else "BAM VAO DEN GIAO THONG DE CHON DEN"
+            prev_img = draw_overlay(preview, line_prev, rect_prev, prev_state, {}, hint,
+                                    show_light=light_ok and light_mode == "auto")
             p1, p2 = line_prev.pts()
             mid = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
             dy = 45 if direction == "down" else -45
@@ -1101,6 +1321,7 @@ with tab_real:
                         nrx, nry, nrw, nrh = snap_light_roi(preview, cx, cy)
                         st.session_state.pending_cfg = dict(rx=min(nrx, 99), ry=min(nry, 99), rw=min(max(nrw, 1), 50),
                                                             rh=min(max(nrh, 1), 60), light_mode="auto")
+                        st.session_state.light_confirmed_for = source_key
                     else:
                         pt = (round(cx / Wp * 100), round(cy / Hp * 100))
                         if st.session_state.line_first_pt is None:
@@ -1112,28 +1333,39 @@ with tab_real:
                             st.session_state.line_first_pt = None
                     st.rerun()
 
+                if not light_ok:
+                    banner("<b>Chưa chọn đèn.</b> Chọn công cụ 🚦 rồi bấm lên ảnh, vào đúng <b>đèn tròn</b> điều khiển "
+                           "làn xe cần giám sát (không phải đèn mũi tên rẽ). Nếu video không quay được đèn, chọn "
+                           "“coi như luôn đỏ” ở mục Trạng thái đèn.", good="warn")
                 z1, z2 = st.columns([1, 4], vertical_alignment="center")
-                if light_roi_img.size:
+                if light_ok and light_mode == "auto" and light_roi_img.size:
                     zoom = cv2.resize(light_roi_img, (96, max(1, int(96 * light_roi_img.shape[0] / max(light_roi_img.shape[1], 1)))),
                                       interpolation=cv2.INTER_NEAREST)
                     z1.image(zoom, channels="BGR", width="stretch")
-                z2.markdown(f"Bên trong khung đèn &nbsp; {pill(prev_state)}<br>"
-                            f"<span style='color:{C_MUTED};font-size:.85rem'>Khung đầu tiên của video · "
-                            f"mũi tên xanh = hướng xe chạy</span>", unsafe_allow_html=True)
-                if prev_state == "UNKNOWN" and light_mode == "auto":
+                if light_ok and light_mode != "auto":
+                    z2.markdown(f"Không dùng camera để đọc đèn &nbsp; {pill(prev_state)}", unsafe_allow_html=True)
+                elif light_ok:
+                    z2.markdown(f"Bên trong khung đèn &nbsp; {pill(prev_state)}<br>"
+                                f"<span style='color:{C_MUTED};font-size:.85rem'>Khung đầu tiên của video · "
+                                f"mũi tên xanh = hướng xe chạy</span>", unsafe_allow_html=True)
+                if light_ok and prev_state == "UNKNOWN" and light_mode == "auto":
                     st.caption("Chưa thấy đèn sáng trong khung. Bấm lại vào đúng đèn, hoặc chọn “coi như luôn đỏ” "
                                "nếu video không quay được đèn.")
 
         step(3, "Phân tích", "")
-        can_run = not (input_type == "🖼️ Ảnh" and background is None)
-        if not can_run:
+        can_run = light_ok and not (input_type == "🖼️ Ảnh" and background is None)
+        if input_type == "🖼️ Ảnh" and background is None:
             banner("Với 1–2 ảnh, hãy tải thêm ảnh nền đường trống, hoặc tải từ 3 ảnh liên tiếp trở lên.", good=False)
+        if not light_ok:
+            st.caption("Nút phân tích sẽ mở khi bạn đã chọn đèn ở Bước 2.")
         run = st.button("🔍  Phân tích vi phạm", type="primary", disabled=not can_run, width="stretch")
         if run:
             progress = st.progress(0.0, text="Đang chuẩn bị...")
             try:
                 if input_type == "🎥 Video":
-                    res = analyze_video(video_path, cfg, progress)
+                    sc_ = st.session_state.get("scene_info") or {}
+                    res = analyze_video(video_path, cfg, progress, start=sc_.get("start", 0.0),
+                                        end=sc_.get("end"), box=sc_.get("box"))
                 else:
                     frames = ((float(i), img) for i, img in enumerate(images))
                     res = analyze_frames(frames, cfg, fps_eff=1.0, background=background,
@@ -1146,6 +1378,7 @@ with tab_real:
                 res["source"] = source_key
                 res["kind"] = "video" if input_type == "🎥 Video" else "image"
                 res["light_mode"] = cfg["light_mode"]
+                res["direction"] = cfg["direction"]
                 st.session_state.analysis = res
                 now = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
                 src_name = source_key.split(":")[1] if source_key else ""
@@ -1153,7 +1386,9 @@ with tab_real:
                     st.session_state.violations_log.append({
                         "Mã xe": v["MaXe"], "Loại xe": v["LoaiXe"], "Thời điểm": v["ThoiDiem"],
                         "Đèn": v["TrangThaiDen"], "Vị trí": v["ViTri"],
-                        "Nguồn": src_name, "Phân tích lúc": now,
+                        "Nguồn": src_name + (f" · {(st.session_state.get('scene_info') or {}).get('label')}"
+                                             if input_type == "🎥 Video" and (st.session_state.get('scene_info') or {}).get('label') else ""),
+                        "Phân tích lúc": now,
                     })
                 st.rerun()
 
@@ -1183,6 +1418,14 @@ with tab_real:
                 banner(f"<b>Suốt đoạn đã xét, đèn chưa lần nào được nhận là ĐỎ</b> (chỉ thấy: {seen_txt}). "
                        "Nếu thực tế đèn đỏ, có thể khung đèn đang đặt sai chỗ, ví dụ trúng đèn mũi tên rẽ phải. "
                        "Hãy bấm lại vào đúng đèn tròn ở Bước 2 rồi phân tích lại.", good="warn")
+            n_dn, n_up = res.get("moving_down", 0), res.get("moving_up", 0)
+            chosen_dir = res.get("direction", "down")
+            n_same, n_opp = (n_dn, n_up) if chosen_dir == "down" else (n_up, n_dn)
+            if res["kind"] == "video" and n_opp >= 3 and n_opp > 1.5 * n_same:
+                other = "Từ dưới lên ↑" if chosen_dir == "down" else "Từ trên xuống ↓"
+                banner(f"<b>Có thể bạn chọn ngược hướng xe chạy.</b> Trong vùng vạch dừng, {n_opp} xe đi theo hướng "
+                       f"<b>{other}</b>, chỉ {n_same} xe đi theo hướng đã chọn. Mẹo: nếu thấy đuôi xe / lưng người lái "
+                       "thì xe đang đi ra xa camera (từ dưới lên).", good="warn")
             if res["kind"] == "video" and res["n_frames"] and res.get("skipped", 0) / res["n_frames"] > 0.15:
                 banner(f"{res['skipped']} / {res['n_frames']} khung hình bị bỏ qua vì gần như cả khung đều chuyển động. "
                        "Video có thể bị rung, bị quay lại từ màn hình điện thoại, hoặc có chữ/hiệu ứng chạy đè lên. "

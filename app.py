@@ -300,9 +300,15 @@ class StopLine:
         return -tol <= t <= 1 + tol
 
     def ref_point(self, box):
-        """Điểm đầu xe: đáy hộp nếu xe chạy xuống, đỉnh hộp nếu xe chạy lên."""
+        """Điểm tiếp đất gần camera nhất (giữa cạnh dưới của khung).
+
+        Khi trừ nền làm dính khung xe với xe khác, phần dính thừa luôn nằm ở phía trên khung (xa camera hơn),
+        nên cạnh dưới là điểm ổn định nhất của chính chiếc xe gần camera.
+        - Xe chạy xuống (về phía camera): cạnh dưới = đầu xe.
+        - Xe chạy lên (ra xa camera): cạnh dưới = đuôi xe ⇒ tính vi phạm khi cả thân xe đã qua vạch.
+        """
         x, y, w, h = box
-        return (x + w / 2, y + h) if self.direction == "down" else (x + w / 2, y)
+        return (x + w / 2, y + h)
 
     def pts(self):
         return tuple(self.p1.astype(int)), tuple(self.p2.astype(int))
@@ -327,7 +333,7 @@ def classify_light(roi_bgr):
     H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
     lit = (S >= 90) & (V >= 140)
     masks = {
-        "RED": lit & ((H <= 12) | (H >= 165)),
+        "RED": lit & ((H <= 14) | (H >= 165)),
         "YELLOW": lit & (H >= 15) & (H <= 35),
         "GREEN": lit & (H >= 40) & (H <= 95),
     }
@@ -400,7 +406,9 @@ class VideoVehicleDetector:
     def detect(self, frame, min_area, ignore_rect=None, max_area=None):
         """Trả về (danh sách khung xe, tỉ lệ điểm ảnh chuyển động trên toàn khung hình)."""
         fg = self.bg.apply(cv2.GaussianBlur(frame, (5, 5), 0))
-        _, fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)  # bỏ bóng đổ (giá trị 127)
+        # MOG2 đánh dấu "bóng đổ" = 127. Xe màu tối (ô tô đen, áo mưa sẫm) cũng hay bị coi là bóng đổ,
+        # nên giữ lại cả vùng này; bóng thật dính liền với xe chỉ làm khung rộng ra một chút.
+        _, fg = cv2.threshold(fg, 100, 255, cv2.THRESH_BINARY)
         ratio = float(np.count_nonzero(fg)) / fg.size
         boxes, _ = mask_to_boxes(fg, min_area, ignore_rect, max_area)
         return boxes, ratio
@@ -427,7 +435,9 @@ def snap_light_roi(frame, px, py):
     x0, y0, x1, y1 = max(0, px - r), max(0, py - r), min(W, px + r), min(H, py + r)
     hsv = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
     Hh, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-    lit = ((S >= 90) & (V >= 140) & ((Hh <= 12) | (Hh >= 160) | ((Hh >= 15) & (Hh <= 95)))).astype(np.uint8)
+    colored = (S >= 90) & (V >= 140) & ((Hh <= 14) | (Hh >= 160) | ((Hh >= 15) & (Hh <= 95)))
+    overexposed = (V >= 235) & (S < 80)  # tâm bóng đèn bị cháy sáng thành màu trắng
+    lit = (colored | overexposed).astype(np.uint8)
     n, _, stats, cents = cv2.connectedComponentsWithStats(lit, 8)
     best = None
     for k in range(1, n):
@@ -445,10 +455,58 @@ def snap_light_roi(frame, px, py):
         cx, cy = bx + x0 + bw / 2, by + y0 + bh / 2
         half_w, half_h = max(bw * 1.3, 0.015 * W), max(bh * 1.3, 0.015 * H)
     else:
-        cx, cy, half_w, half_h = px, py, 0.03 * W, 0.04 * H
+        return None  # chỗ bấm không có đốm đèn sáng nào
     rx0, ry0 = max(0.0, (cx - half_w) / W * 100), max(0.0, (cy - half_h) / H * 100)
     rx1, ry1 = min(100.0, (cx + half_w) / W * 100), min(100.0, (cy + half_h) / H * 100)
     return int(rx0), int(ry0), max(1, int(np.ceil(rx1 - int(rx0)))), max(1, int(np.ceil(ry1 - int(ry0))))
+
+
+def merge_fragments(boxes, W, H, max_area=None):
+    """Gộp các mảnh của cùng một xe (trừ nền hay tách xe thành nóc / thân / đuôi) thành một khung."""
+    boxes = [list(b) for b in boxes]
+    gx, gy = 0.01 * W, 0.02 * H
+    changed = True
+    while changed and len(boxes) > 1:
+        changed = False
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                a, b = boxes[i], boxes[j]
+                ix = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+                iy = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+                touching = ix > -gx and iy > -gy
+                small, big = sorted((a[2] * a[3], b[2] * b[3]))
+                # mảnh nhỏ nằm sát/chồng lên khung lớn (nóc, đuôi xe...). Hai xe cùng cỡ nối đuôi nhau thì KHÔNG gộp.
+                stacked = ix >= 0.6 * min(a[2], b[2]) and small < 0.35 * big
+                overlap = ix > 0 and iy > 0 and ix * iy >= 0.3 * small
+                if touching and (stacked or overlap):
+                    x0, y0 = min(a[0], b[0]), min(a[1], b[1])
+                    x1, y1 = max(a[0] + a[2], b[0] + b[2]), max(a[1] + a[3], b[1] + b[3])
+                    if max_area is None or (x1 - x0) * (y1 - y0) <= max_area:
+                        boxes[i] = [x0, y0, x1 - x0, y1 - y0]
+                        del boxes[j]
+                        changed = True
+                        break
+            if changed:
+                break
+    return [tuple(int(v) for v in b) for b in boxes]
+
+
+def box_iou(a, b):
+    ix = max(0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    return inter / max(1.0, a[2] * a[3] + b[2] * b[3] - inter)
+
+
+def same_vehicle(a, b):
+    """Hai khung có phải cùng một xe không (trùng nhau, hoặc tâm khung này nằm trong khung kia)."""
+    if box_iou(a, b) > 0.1:
+        return True
+    for p, q in ((a, b), (b, a)):
+        cx, cy = p[0] + p[2] / 2, p[1] + p[3] / 2
+        if q[0] <= cx <= q[0] + q[2] and q[1] <= cy <= q[1] + q[3]:
+            return True
+    return False
 
 
 # ---------- Mô hình C: ghép cặp xe giữa các khung hình ----------
@@ -470,11 +528,15 @@ class VehicleTracker:
         cents = [self._center(b) for b in boxes]
         used_t, used_d = set(), set()
         if ids and boxes:
-            cost = np.array([[np.linalg.norm(self.tracks[i]["c"] - c) for c in cents] for i in ids])
+            # so với vị trí DỰ ĐOÁN (vị trí cũ + vận tốc × số khung bị mất dấu) để không mất dấu xe chạy nhanh
+            pred = {i: self.tracks[i]["c"] + self.tracks[i]["v"] * (1 + self.tracks[i]["missed"]) for i in ids}
+            cost = np.array([[np.linalg.norm(pred[i] - c) for c in cents] for i in ids])
             rows, cols = linear_sum_assignment(cost)
             for r, c in zip(rows, cols):
-                if cost[r, c] <= self.max_dist:
-                    t = self.tracks[ids[r]]
+                t = self.tracks[ids[r]]
+                if cost[r, c] <= self.max_dist * (1 + 0.3 * t["missed"]):
+                    step_v = (cents[c] - t["c"]) / (1 + t["missed"])
+                    t["v"] = 0.6 * t["v"] + 0.4 * step_v if t["age"] > 1 else step_v
                     t.update(box=boxes[c], c=cents[c], missed=0, age=t["age"] + 1)
                     used_t.add(ids[r])
                     used_d.add(c)
@@ -485,14 +547,19 @@ class VehicleTracker:
                     del self.tracks[tid]
         for j, b in enumerate(boxes):
             if j not in used_d:
-                self.tracks[self.next_id] = dict(box=b, c=cents[j], c0=cents[j], missed=0, age=1, moved=False,
+                self.tracks[self.next_id] = dict(box=b, c=cents[j], c0=cents[j], v=np.zeros(2), missed=0, age=1, moved=False,
                                                  seen_before=False, done=False, violation=False)
                 self.next_id += 1
         return {tid: t for tid, t in self.tracks.items() if t["missed"] == 0}
 
 
 def vehicle_type(box, frame_area, car_area_pct):
-    return "Ô tô" if box[2] * box[3] / frame_area * 100 >= car_area_pct else "Xe máy"
+    """Ước lượng theo kích thước + tỉ lệ khung: xe máy thường hẹp và cao, ô tô rộng và to."""
+    area_pct = box[2] * box[3] / frame_area * 100
+    ratio = box[2] / max(box[3], 1)
+    if area_pct >= car_area_pct or (ratio >= 0.95 and area_pct >= 0.4 * car_area_pct):
+        return "Ô tô"
+    return "Xe máy"
 
 
 def draw_overlay(frame, line, light_rect, light_state, active, info_text, show_light=True):
@@ -561,7 +628,7 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
             max_area = cfg.get("max_area_pct", 20) / 100 * frame_area
             diag = float(np.hypot(W, H))
             max_dist = (0.35 if background is not None else 0.12 * max(1, cfg["frame_step"]) ** 0.5) * diag
-            tracker = VehicleTracker(max_dist=min(max_dist, 0.4 * diag))
+            tracker = VehicleTracker(max_dist=min(max_dist, 0.4 * diag), max_missed=max(8, int(1.5 * fps_eff)))
             if background is None:
                 detector = VideoVehicleDetector(cfg["sensitivity"])
 
@@ -585,7 +652,22 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
             results["skipped"] += 1
         if i < warmup or shaky:
             boxes = []
+        boxes = merge_fragments(boxes, W, H, max_area)
         active = tracker.update(boxes)
+        for tr in active.values():
+            tr["t_last"] = t_sec
+        for tid, tr in active.items():
+            if tr["age"] == 1 and "first_db" not in tr:
+                x_, y_, w_, h_ = tr["box"]
+                head = line.ref_point(tr["box"])
+                tail = (x_ + w_ / 2, y_)
+                tr["first_db"] = line.dist_before(head)
+                tr["first_tail_db"] = line.dist_before(tail)
+                # mảnh mới sinh ra đè lên một xe đã được xét ⇒ thừa hưởng kết quả, không tính lại
+                for other_id, other in active.items():
+                    if other_id != tid and other["age"] > 1 and other["done"] and same_vehicle(tr["box"], other["box"]):
+                        tr["done"], tr["violation"] = True, other["violation"]
+                        break
 
         new_viol = []
         for tid, tr in active.items():
@@ -600,12 +682,30 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
                 continue
             if db > margin:
                 tr["seen_before"] = True
-            elif db < -margin and tr["seen_before"] and not tr["done"] and tr["age"] >= 2:
+            # Xe đã từng ở trước vạch, HOẶC lúc mới xuất hiện thân xe đang nằm vắt qua vạch
+            # (xe có sẵn từ đầu cảnh / đi vào từ mép khung hình ngay sát vạch)
+            straddled = tr.get("first_tail_db", -1) > margin and tr.get("first_db", 0) < margin
+            progressed = tr.get("first_db", db) - db > 0.04 * H  # thực sự đã chạy qua, không đứng yên
+            if db < -margin and not tr["done"] and tr["age"] >= 2 and (
+                    tr["seen_before"] or (straddled and progressed)):
                 tr["done"] = True
+                recent = results.setdefault("_recent", [])
+                dup = any(oid != tid and o["done"] and same_vehicle(tr["box"], o["box"]) for oid, o in active.items())
+                cx_, cy_ = tr["c"]
+                for t0, o in recent:  # o = xe đã qua vạch trước đó (giữ vị trí cuối cùng nhìn thấy)
+                    dt = t_sec - o.get("t_last", t0)
+                    if t_sec - t0 > 4.0:
+                        continue
+                    reach = 0.8 * max(o["box"][2], o["box"][3], tr["box"][2], tr["box"][3]) + 0.12 * H * max(dt, 0) + 0.04 * H
+                    if same_vehicle(tr["box"], o["box"]) or np.hypot(cx_ - o["c"][0], cy_ - o["c"][1]) <= reach:
+                        dup = True
+                        break
+                recent.append((t_sec, tr))
                 if state == "RED":
                     tr["violation"] = True
-                    new_viol.append(tid)
-                else:
+                    if not dup:  # mảnh khác của cùng một xe vừa được ghi ⇒ không ghi thêm
+                        new_viol.append(tid)
+                elif not dup:
                     results["crossed_ok"] += 1
 
         # Thống kê hướng di chuyển thực tế của xe (để phát hiện chọn nhầm hướng)
@@ -639,7 +739,7 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
                 "LoaiXe": vehicle_type(b, frame_area, cfg["car_area_pct"]) + " (ước lượng)",
                 "ThoiDiem": f"{t_sec:.1f} s",
                 "TrangThaiDen": STATE_VN[state],
-                "ViTri": f"Đầu xe ({int(ref[0])}, {int(ref[1])}) đã qua vạch",
+                "ViTri": f"Xe đã qua vạch tại ({int(ref[0])}, {int(ref[1])})",
                 "snapshot": encode_jpg(out),
                 "crop": encode_jpg(crop_box(frame, b)),
             })
@@ -652,6 +752,7 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
         if progress is not None and total:
             progress.progress(min(1.0, (i + 1) / total), text=f"Đang xử lý khung {i + 1}/{total}")
 
+    results.pop("_recent", None)
     results["n_vehicles"] = len(results["vehicle_ids"])
     return results
 
@@ -1318,10 +1419,15 @@ with tab_real:
                     cx = int(click["x"] * Wp / max(click["width"], 1))
                     cy = int(click["y"] * Hp / max(click["height"], 1))
                     if tool == "🚦 Chọn đèn":
-                        nrx, nry, nrw, nrh = snap_light_roi(preview, cx, cy)
-                        st.session_state.pending_cfg = dict(rx=min(nrx, 99), ry=min(nry, 99), rw=min(max(nrw, 1), 50),
-                                                            rh=min(max(nrh, 1), 60), light_mode="auto")
-                        st.session_state.light_confirmed_for = source_key
+                        snapped = snap_light_roi(preview, cx, cy)
+                        if snapped is None:
+                            st.session_state.light_miss = source_key
+                        else:
+                            nrx, nry, nrw, nrh = snapped
+                            st.session_state.light_miss = None
+                            st.session_state.pending_cfg = dict(rx=min(nrx, 99), ry=min(nry, 99), rw=min(max(nrw, 1), 50),
+                                                                rh=min(max(nrh, 1), 60), light_mode="auto")
+                            st.session_state.light_confirmed_for = source_key
                     else:
                         pt = (round(cx / Wp * 100), round(cy / Hp * 100))
                         if st.session_state.line_first_pt is None:
@@ -1333,6 +1439,9 @@ with tab_real:
                             st.session_state.line_first_pt = None
                     st.rerun()
 
+                if st.session_state.get("light_miss") == source_key and tool == "🚦 Chọn đèn":
+                    banner("<b>Chỗ vừa bấm không có đèn đang sáng</b>, nên chưa đặt khung đèn. Hãy bấm đúng vào bóng đèn "
+                           "đang sáng (đỏ, vàng hoặc xanh). Nếu muốn vẽ vạch dừng, chọn công cụ 📏 trước.", good=False)
                 if not light_ok:
                     banner("<b>Chưa chọn đèn.</b> Chọn công cụ 🚦 rồi bấm lên ảnh, vào đúng <b>đèn tròn</b> điều khiển "
                            "làn xe cần giám sát (không phải đèn mũi tên rẽ). Nếu video không quay được đèn, chọn "

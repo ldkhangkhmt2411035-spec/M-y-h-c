@@ -632,7 +632,12 @@ def same_vehicle(a, b):
 
 # ---------- Mô hình C: ghép cặp xe giữa các khung hình ----------
 class VehicleTracker:
-    """Ghép cặp xe giữa khung t và t+1 bằng khoảng cách tâm + thuật toán Hungarian."""
+    """Mô hình C – ghép cặp cùng một xe giữa khung t và t+1.
+
+    Chi phí ghép = 1 − IoU giữa khung DỰ ĐOÁN (khung cũ dịch theo vận tốc) và khung mới; chỉ khi hai khung
+    không chồng nhau mới xét khoảng cách tâm (trong phạm vi nửa thân xe). Kích thước phải tương đương.
+    Giải bài toán ghép cặp tối ưu bằng thuật toán Hungarian. Cách này hạn chế "nhảy ID" sang xe khác.
+    """
 
     def __init__(self, max_dist, max_missed=8, diag=1000.0):
         self.max_dist = max_dist
@@ -649,29 +654,37 @@ class VehicleTracker:
         ids = list(self.tracks)
         cents = [self._center(b) for b in boxes]
         used_t, used_d = set(), set()
+        BIG = 1e9
         if ids and boxes:
-            # so với vị trí DỰ ĐOÁN (vị trí cũ + vận tốc × số khung bị mất dấu) để không mất dấu xe chạy nhanh
-            pred = {i: self.tracks[i]["c"] + self.tracks[i]["v"] * (1 + self.tracks[i]["missed"]) for i in ids}
-            cost = np.array([[np.linalg.norm(pred[i] - c) for c in cents] for i in ids])
-            BIG = 1e9
+            cost = np.full((len(ids), len(boxes)), BIG)
             for r, i in enumerate(ids):
-                tb = self.tracks[i]["box"]
-                # xe chỉ đi được một đoạn cỡ thân xe giữa hai khung xét ⇒ cổng tỉ lệ với kích thước xe
-                gate = min(self.max_dist, max(0.8 * max(tb[2], tb[3]), 0.04 * self.diag)) * (
-                    1 + 0.5 * min(self.tracks[i]["missed"], 3))
+                t = self.tracks[i]
+                k = min(t["missed"], 3) + 1
+                shift = t["v"] * k
+                tb = t["box"]
+                pb = (tb[0] + shift[0], tb[1] + shift[1], tb[2], tb[3])  # khung dự đoán
+                size = max(tb[2], tb[3])
                 for c, b in enumerate(boxes):
                     ratio = (b[2] * b[3]) / max(1.0, tb[2] * tb[3])
-                    if cost[r, c] > gate or not (0.3 <= ratio <= 3.3):
-                        cost[r, c] = BIG  # không cho ghép: quá xa hoặc kích thước khác hẳn (xe khác)
+                    if not (0.33 <= ratio <= 3.0):
+                        continue  # kích thước khác hẳn ⇒ xe khác
+                    iou = box_iou(pb, b)
+                    if iou >= 0.05:
+                        cost[r, c] = 1.0 - iou
+                    else:
+                        dist = float(np.linalg.norm(t["c"] + shift - cents[c]))
+                        if dist <= min(0.5 * size * k, self.max_dist):
+                            cost[r, c] = 1.0 + dist / max(size, 1.0)
             rows, cols = linear_sum_assignment(cost)
             for r, c in zip(rows, cols):
+                if cost[r, c] >= BIG:
+                    continue
                 t = self.tracks[ids[r]]
-                if cost[r, c] < BIG:
-                    step_v = (cents[c] - t["c"]) / (1 + t["missed"])
-                    t["v"] = 0.6 * t["v"] + 0.4 * step_v if t["age"] > 1 else step_v
-                    t.update(box=boxes[c], c=cents[c], missed=0, age=t["age"] + 1)
-                    used_t.add(ids[r])
-                    used_d.add(c)
+                step_v = (cents[c] - t["c"]) / (1 + t["missed"])
+                t["v"] = 0.6 * t["v"] + 0.4 * step_v if t["age"] > 1 else step_v
+                t.update(box=boxes[c], c=cents[c], missed=0, age=t["age"] + 1)
+                used_t.add(ids[r])
+                used_d.add(c)
         for tid in ids:
             if tid not in used_t:
                 self.tracks[tid]["missed"] += 1
@@ -679,8 +692,9 @@ class VehicleTracker:
                     del self.tracks[tid]
         for j, b in enumerate(boxes):
             if j not in used_d:
-                self.tracks[self.next_id] = dict(box=b, c=cents[j], c0=cents[j], v=np.zeros(2), missed=0, age=1, moved=False,
-                                                 seen_before=False, done=False, violation=False)
+                self.tracks[self.next_id] = dict(box=b, c=cents[j], c0=cents[j], v=np.zeros(2), missed=0, age=1,
+                                                 moved=False, seen_before=False, done=False, violation=False,
+                                                 hist=deque(maxlen=60))
                 self.next_id += 1
         return {tid: t for tid, t in self.tracks.items() if t["missed"] == 0}
 
@@ -818,8 +832,17 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
             if cross_m is None:
                 cross_m = max(margin, 0.015 * H)
             tr["max_db"] = max(tr.get("max_db", db), db)
+            tr["hist"].append((t_sec, db, float(tr["c"][0]), tr["box"][2], ref))
             if db > cross_m:
                 tr["seen_before"] = True
+            # Quỹ đạo liền mạch: lần gần nhất xe còn ở TRƯỚC vạch phải cách đây ≤ 3 s và cùng làn
+            # (tâm xe lệch ngang không quá ~ một thân xe). Chặn trường hợp ID nhảy từ xe này sang xe khác.
+            continuous = False
+            for (th, dbh, cxh, wh, _) in reversed(tr["hist"]):
+                if dbh > cross_m:
+                    continuous = (t_sec - th <= 3.0
+                                  and abs(float(tr["c"][0]) - cxh) <= max(0.8 * max(wh, tr["box"][2]), 0.06 * W))
+                    break
             # Xe đã từng ở trước vạch, HOẶC lúc mới xuất hiện thân xe đang nằm vắt qua vạch
             # (xe có sẵn từ đầu cảnh / đi vào từ mép khung hình ngay sát vạch)
             straddled = tr.get("first_tail_db", -1) > margin and tr.get("first_db", 0) < margin
@@ -830,7 +853,7 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
             vehicle_like = (bw_ * bh_ >= 1.5 * min_area and 0.3 <= bw_ / max(bh_, 1) <= 2.4
                             and bh_ >= 0.035 * H)
             if db < -cross_m and not tr["done"] and tr["age"] >= 3 and vehicle_like and progressed and (
-                    tr["seen_before"] or straddled):
+                    (tr["seen_before"] and continuous) or (straddled and tr["age"] <= 4 * fps_eff)):
                 tr["done"] = True
                 tr["t_cross"] = t_sec
                 recent = results.setdefault("_recent", [])
@@ -901,13 +924,20 @@ def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=N
         for tid in new_viol:
             b = active[tid]["box"]
             ref = line.ref_point(b)
+            # ảnh bằng chứng: vẽ thêm đường đi của xe (điểm tiếp đất qua các khung) cắt qua vạch dừng
+            ev = out.copy()
+            pts = [(int(p[4][0]), int(p[4][1])) for p in active[tid].get("hist", [])]
+            if len(pts) >= 2:
+                cv2.polylines(ev, [np.array(pts, np.int32)], False, (0, 255, 255), 2, cv2.LINE_AA)
+                cv2.circle(ev, pts[0], 5, (0, 255, 255), -1)
+                cv2.arrowedLine(ev, pts[max(0, len(pts) - 4)], pts[-1], (0, 255, 255), 2, tipLength=0.5)
             results["violations"].append({
                 "MaXe": f"ID-{tid:03d}",
                 "LoaiXe": vehicle_type(b, frame_area, cfg["car_area_pct"]) + " (ước lượng)",
                 "ThoiDiem": f"{t_sec:.1f} s",
                 "TrangThaiDen": STATE_VN[state],
                 "ViTri": f"Xe đã qua vạch tại ({int(ref[0])}, {int(ref[1])})",
-                "snapshot": encode_jpg(out),
+                "snapshot": encode_jpg(ev),
                 "crop": encode_jpg(crop_box(frame, b)),
             })
         for idx, tid in replace_evidence:

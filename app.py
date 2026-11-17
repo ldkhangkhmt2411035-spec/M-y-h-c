@@ -21,10 +21,21 @@ except ImportError:
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(APP_DIR, "mo_hinh")
-MODEL_PATH = os.path.join(MODEL_DIR, "he_thong_canh_bao.joblib")     # notebook, mục E: lưu mô hình
-RESULT_PATH = os.path.join(MODEL_DIR, "ket_qua_tong_hop.json")       # notebook: mọi số liệu đánh giá
+
+
+def _tim(ten):
+    """Tìm file trong mo_hinh/ trước, nếu không có thì tìm cạnh app.py (repo để file ở thư mục gốc)."""
+    for d in (MODEL_DIR, APP_DIR):
+        p = os.path.join(d, ten)
+        if os.path.exists(p):
+            return p
+    return os.path.join(MODEL_DIR, ten)
+
+
+MODEL_PATH = _tim("he_thong_canh_bao.joblib")     # notebook, mục E: lưu mô hình
+RESULT_PATH = _tim("ket_qua_tong_hop.json")       # notebook: mọi số liệu đánh giá
 SAMPLE_VIDEO = os.path.join(APP_DIR, "video_thu.mp4")
-NOTEBOOK_SAMPLE = os.path.join(MODEL_DIR, "video_mau_test.mp4")      # video ghép từ frame test (notebook mục F1)
+NOTEBOOK_SAMPLE = _tim("video_mau_test.mp4")      # video ghép từ frame test (notebook mục F1)
 
 # ==========================================
 # CẤU HÌNH TRANG & GIAO DIỆN

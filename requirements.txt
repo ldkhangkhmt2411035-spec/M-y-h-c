@@ -6,7 +6,10 @@ pandas
 pillow
 plotly
 scikit-image
-scikit-learn
+# Mô hình trong mo_hinh/he_thong_canh_bao.joblib được lưu bằng scikit-learn 1.6.1 (xem ket_qua_tong_hop.json → moi_truong).
+# Giữ đúng phiên bản này để nạp k-NN, SVM-RBF và pipeline của C không bị lỗi hay sai kết quả.
+scikit-learn==1.6.1
+joblib
 scipy
 imageio
 imageio-ffmpeg

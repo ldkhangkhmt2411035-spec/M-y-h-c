@@ -1,6 +1,7 @@
+import json
 import os
 import tempfile
-from collections import Counter, deque
+import time
 from datetime import datetime
 
 import cv2
@@ -9,8 +10,9 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from scipy.optimize import linear_sum_assignment
 from skimage.feature import hog
+
+from he_thong import (BoTheoDoi, HeThongCanhBao, TEN_NHOM_DEN, dac_trung_den_anh, hog_lo)
 
 try:  # cho phép bấm chuột lên ảnh để chọn đèn / vạch dừng
     from streamlit_image_coordinates import streamlit_image_coordinates as image_picker
@@ -18,7 +20,11 @@ except ImportError:
     image_picker = None
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(APP_DIR, "mo_hinh")
+MODEL_PATH = os.path.join(MODEL_DIR, "he_thong_canh_bao.joblib")     # notebook, mục E: lưu mô hình
+RESULT_PATH = os.path.join(MODEL_DIR, "ket_qua_tong_hop.json")       # notebook: mọi số liệu đánh giá
 SAMPLE_VIDEO = os.path.join(APP_DIR, "video_thu.mp4")
+NOTEBOOK_SAMPLE = os.path.join(MODEL_DIR, "video_mau_test.mp4")      # video ghép từ frame test (notebook mục F1)
 
 # ==========================================
 # CẤU HÌNH TRANG & GIAO DIỆN
@@ -223,30 +229,7 @@ if "use_sample" not in st.session_state:
 
 
 # ==========================================
-# CƠ SỞ DỮ LIỆU HIỆU NĂNG MÔ HÌNH (ML BENCHMARK)
-# ==========================================
-MODEL_PERFORMANCE = {
-    "Model_A": {
-        "k-NN (k=3)": {"accuracy": 98.2, "f1": 0.98, "latency": "1.2 ms", "desc": "Phân loại màu đèn dựa trên khoảng cách HSV"},
-        "Softmax Regression": {"accuracy": 96.5, "f1": 0.96, "latency": "0.4 ms", "desc": "Hồi quy đa lớp tốc độ cao"},
-        "MLP Classifier": {"accuracy": 99.1, "f1": 0.99, "latency": "2.1 ms", "desc": "Mạng Nơ-ron nhân tạo đa tầng tối ưu nhất"},
-    },
-    "Model_B": {
-        "Logistic Regression": {"accuracy": 91.4, "f1": 0.91, "latency": "4.5 ms", "desc": "Phân loại xe / nền trên vector HOG+PCA"},
-        "Perceptron": {"accuracy": 87.2, "f1": 0.86, "latency": "1.1 ms", "desc": "Mô hình tuyến tính đơn giản"},
-        "k-NN (k=5)": {"accuracy": 93.8, "f1": 0.93, "latency": "12.0 ms", "desc": "Độ chính xác tốt nhưng tốn thời gian tính toán"},
-        "MLP Classifier": {"accuracy": 95.6, "f1": 0.95, "latency": "8.3 ms", "desc": "Học đặc trưng phi tuyến tính từ HOG"},
-    },
-    "Model_C": {
-        "Logistic Regression": {"accuracy": 92.1, "f1": 0.92, "latency": "1.5 ms", "desc": "Xác định cùng 1 xe giữa 2 khung hình"},
-        "k-NN": {"accuracy": 90.5, "f1": 0.90, "latency": "3.2 ms", "desc": "Ghép cặp dựa trên khoảng cách vị trí"},
-        "MLP Classifier": {"accuracy": 94.8, "f1": 0.94, "latency": "4.1 ms", "desc": "Dự đoán quỹ đạo chuyển động chính xác"},
-    },
-}
-
-
-# ==========================================
-# PIPELINE XỬ LÝ ẢNH / VIDEO THẬT
+# TIỆN ÍCH ẢNH / VIDEO
 # ==========================================
 BGR_RED, BGR_GREEN, BGR_YELLOW, BGR_GRAY = (0, 0, 255), (0, 200, 0), (0, 215, 255), (160, 160, 160)
 STATE_COLOR = {"RED": BGR_RED, "GREEN": BGR_GREEN, "YELLOW": BGR_YELLOW, "UNKNOWN": BGR_GRAY}
@@ -273,60 +256,10 @@ def pct_rect_to_px(rect_pct, shape):
     return x0, y0, max(x0 + 1, x1), max(y0 + 1, y1)
 
 
-class StopLine:
-    """Vạch dừng là đoạn thẳng (x1,y1)-(x2,y2). Tính khoảng cách có dấu: dương = chưa tới vạch, âm = đã vượt."""
+def bright_lamp_color(roi_bgr):
+    """CHỈ dùng cho công cụ bấm chọn đèn (tìm bóng đèn đang sáng để ôm khung), KHÔNG phải mô hình A.
 
-    def __init__(self, line_pct, shape, direction):
-        h, w = shape[:2]
-        x1, y1, x2, y2 = line_pct
-        self.p1 = np.array([w * x1 / 100, h * y1 / 100], dtype=float)
-        self.p2 = np.array([w * x2 / 100, h * y2 / 100], dtype=float)
-        self.d = self.p2 - self.p1
-        self.length = max(float(np.linalg.norm(self.d)), 1.0)
-        self.direction = direction
-        s_top = self._signed(np.array([(self.p1[0] + self.p2[0]) / 2, -1e4]))
-        sign_top = 1.0 if s_top >= 0 else -1.0
-        self.before_sign = sign_top if direction == "down" else -sign_top
-
-    def _signed(self, p):
-        v = np.asarray(p, dtype=float) - self.p1
-        return (self.d[0] * v[1] - self.d[1] * v[0]) / self.length
-
-    def dist_before(self, p):
-        return self._signed(p) * self.before_sign
-
-    def within(self, p, tol=0.05):
-        t = float(np.dot(np.asarray(p, dtype=float) - self.p1, self.d)) / (self.length ** 2)
-        return -tol <= t <= 1 + tol
-
-    def ref_point(self, box):
-        """Điểm tiếp đất gần camera nhất (giữa cạnh dưới của khung).
-
-        Khi trừ nền làm dính khung xe với xe khác, phần dính thừa luôn nằm ở phía trên khung (xa camera hơn),
-        nên cạnh dưới là điểm ổn định nhất của chính chiếc xe gần camera.
-        - Xe chạy xuống (về phía camera): cạnh dưới = đầu xe.
-        - Xe chạy lên (ra xa camera): cạnh dưới = đuôi xe ⇒ tính vi phạm khi cả thân xe đã qua vạch.
-        """
-        x, y, w, h = box
-        return (x + w / 2, y + h)
-
-    def pts(self):
-        return tuple(self.p1.astype(int)), tuple(self.p2.astype(int))
-
-
-# ---------- Mô hình A: nhận diện màu đèn bằng HSV ----------
-def hsv_feature(roi_bgr):
-    """Vector đặc trưng HSV 44 chiều: Hue 18 bin + Saturation 16 bin + Value 10 bin."""
-    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-    h = cv2.calcHist([hsv], [0], None, [18], [0, 180]).flatten()
-    s = cv2.calcHist([hsv], [1], None, [16], [0, 256]).flatten()
-    v = cv2.calcHist([hsv], [2], None, [10], [0, 256]).flatten()
-    feat = np.concatenate([h, s, v])
-    return feat / max(feat.sum(), 1)
-
-
-def classify_light(roi_bgr):
-    """Đếm tỉ lệ điểm ảnh sáng & đậm màu thuộc dải Đỏ / Vàng / Xanh trong vùng đèn."""
+    Đếm tỉ lệ điểm ảnh sáng & đậm màu thuộc dải Đỏ / Vàng / Xanh trong vùng đèn."""
     if roi_bgr is None or roi_bgr.size == 0:
         return "UNKNOWN", {}
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
@@ -367,88 +300,6 @@ def classify_light(roi_bgr):
     return "UNKNOWN", scores
 
 
-class LightTracker:
-    """Làm mượt trạng thái đèn theo thời gian (bỏ phiếu đa số trên vài khung gần nhất)."""
-
-    def __init__(self, mode, window=5):
-        self.mode = mode
-        self.hist = deque(maxlen=window)
-        self.last = "UNKNOWN"
-
-    def update(self, roi_bgr):
-        if self.mode == "red":
-            return "RED"
-        if self.mode == "green":
-            return "GREEN"
-        state, _ = classify_light(roi_bgr)
-        if state != "UNKNOWN":
-            self.hist.append(state)
-            self.n_unknown = 0
-        else:
-            self.n_unknown = getattr(self, "n_unknown", 0) + 1
-            if self.n_unknown > 3 * self.hist.maxlen:  # lâu không thấy đèn sáng ⇒ không còn biết đèn màu gì
-                self.hist.clear()
-                self.last = "UNKNOWN"
-        if self.hist:
-            self.last = Counter(self.hist).most_common(1)[0][0]
-        return self.last
-
-
-# ---------- Mô hình B: phát hiện xe (trừ nền + contour) ----------
-def mask_to_boxes(fg, min_area, ignore_rect=None, max_area=None):
-    """Lọc nhiễu hình thái học rồi lấy khung bao quanh từng vùng chuyển động.
-
-    Bỏ các vùng quá nhỏ (nhiễu, lá cây) và quá lớn (cả đoàn xe dính nhau, camera rung, chuyển cảnh).
-    """
-    k = max(7, (fg.shape[1] // 80) | 1)
-    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, k_open)
-    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k_close)
-    fg = cv2.dilate(fg, k_open, iterations=2)
-    if ignore_rect is not None:
-        x0, y0, x1, y1 = ignore_rect
-        fg[y0:y1, x0:x1] = 0
-    contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes = []
-    for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
-        if w * h < min_area or cv2.contourArea(c) < 0.3 * min_area:
-            continue
-        if max_area is not None and w * h > max_area:
-            continue
-        boxes.append((x, y, w, h))
-    return boxes, fg
-
-
-class VideoVehicleDetector:
-    """Trừ nền thích nghi MOG2 (Gaussian Mixture Model) cho camera cố định."""
-
-    def __init__(self, sensitivity):
-        self.bg = cv2.createBackgroundSubtractorMOG2(history=400, varThreshold=sensitivity, detectShadows=True)
-
-    def detect(self, frame, min_area, ignore_rect=None, max_area=None):
-        """Trả về (danh sách khung xe, tỉ lệ điểm ảnh chuyển động trên toàn khung hình)."""
-        fg = self.bg.apply(cv2.GaussianBlur(frame, (5, 5), 0))
-        # MOG2 đánh dấu "bóng đổ" = 127. Xe màu tối (ô tô đen, áo mưa sẫm) cũng hay bị coi là bóng đổ,
-        # nên giữ lại cả vùng này; bóng thật dính liền với xe chỉ làm khung rộng ra một chút.
-        _, fg = cv2.threshold(fg, 100, 255, cv2.THRESH_BINARY)
-        ratio = float(np.count_nonzero(fg)) / fg.size
-        boxes, _ = mask_to_boxes(fg, min_area, ignore_rect, max_area)
-        return boxes, ratio
-
-
-def detect_by_background(frame, background, min_area, sensitivity, ignore_rect=None, max_area=None):
-    """Dùng cho ảnh tĩnh: so sánh với ảnh nền (đường trống)."""
-    a = cv2.GaussianBlur(frame, (5, 5), 0).astype(np.int16)
-    b = cv2.GaussianBlur(background, (5, 5), 0).astype(np.int16)
-    diff = np.abs(a - b).max(axis=2).astype(np.uint8)
-    _, fg = cv2.threshold(diff, max(15, sensitivity + 5), 255, cv2.THRESH_BINARY)
-    ratio = float(np.count_nonzero(fg)) / fg.size
-    boxes, _ = mask_to_boxes(fg, min_area, ignore_rect, max_area)
-    return boxes, ratio
-
-
 def snap_light_roi(frame, px, py, layout="auto"):
     """Người dùng bấm vào đèn → tìm đốm sáng màu (đỏ/vàng/xanh) gần điểm bấm nhất và ôm khung quanh nó.
 
@@ -481,7 +332,7 @@ def snap_light_roi(frame, px, py, layout="auto"):
         return None  # chỗ bấm không có đốm đèn sáng nào
     lamp = best[1]
     bw, bh = lamp[2], lamp[3]
-    lamp_color, _ = classify_light(frame[lamp[1]:lamp[1] + bh, lamp[0]:lamp[0] + bw])
+    lamp_color, _ = bright_lamp_color(frame[lamp[1]:lamp[1] + bh, lamp[0]:lamp[0] + bw])
     if layout == "lamp":  # chỉ ôm bóng đèn đang sáng
         d_ = max(bw, bh)
         hx0, hy0, hx1, hy1 = lamp[0] - 0.4 * d_, lamp[1] - 0.4 * d_, lamp[0] + bw + 0.4 * d_, lamp[1] + bh + 0.4 * d_
@@ -582,162 +433,6 @@ def expand_to_housing(frame, lamp, lamp_color, force_vertical=None):
     return X0, Y0, X1, Y1
 
 
-def merge_fragments(boxes, W, H, max_area=None):
-    """Gộp các mảnh của cùng một xe (trừ nền hay tách xe thành nóc / thân / đuôi) thành một khung."""
-    boxes = [list(b) for b in boxes]
-    gx, gy = 0.01 * W, 0.02 * H
-    changed = True
-    while changed and len(boxes) > 1:
-        changed = False
-        for i in range(len(boxes)):
-            for j in range(i + 1, len(boxes)):
-                a, b = boxes[i], boxes[j]
-                ix = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
-                iy = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
-                touching = ix > -gx and iy > -gy
-                small, big = sorted((a[2] * a[3], b[2] * b[3]))
-                # mảnh nhỏ nằm sát/chồng lên khung lớn (nóc, đuôi xe...). Hai xe cùng cỡ nối đuôi nhau thì KHÔNG gộp.
-                stacked = ix >= 0.6 * min(a[2], b[2]) and small < 0.35 * big
-                overlap = ix > 0 and iy > 0 and ix * iy >= 0.3 * small
-                if touching and (stacked or overlap):
-                    x0, y0 = min(a[0], b[0]), min(a[1], b[1])
-                    x1, y1 = max(a[0] + a[2], b[0] + b[2]), max(a[1] + a[3], b[1] + b[3])
-                    if max_area is None or (x1 - x0) * (y1 - y0) <= max_area:
-                        boxes[i] = [x0, y0, x1 - x0, y1 - y0]
-                        del boxes[j]
-                        changed = True
-                        break
-            if changed:
-                break
-    return [tuple(int(v) for v in b) for b in boxes]
-
-
-def box_iou(a, b):
-    ix = max(0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
-    iy = max(0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
-    inter = ix * iy
-    return inter / max(1.0, a[2] * a[3] + b[2] * b[3] - inter)
-
-
-def same_vehicle(a, b):
-    """Hai khung có phải cùng một xe không (trùng nhau, hoặc tâm khung này nằm trong khung kia)."""
-    if box_iou(a, b) > 0.1:
-        return True
-    for p, q in ((a, b), (b, a)):
-        cx, cy = p[0] + p[2] / 2, p[1] + p[3] / 2
-        if q[0] <= cx <= q[0] + q[2] and q[1] <= cy <= q[1] + q[3]:
-            return True
-    return False
-
-
-# ---------- Mô hình C: ghép cặp xe giữa các khung hình ----------
-class VehicleTracker:
-    """Mô hình C – ghép cặp cùng một xe giữa khung t và t+1.
-
-    Chi phí ghép = 1 − IoU giữa khung DỰ ĐOÁN (khung cũ dịch theo vận tốc) và khung mới; chỉ khi hai khung
-    không chồng nhau mới xét khoảng cách tâm (trong phạm vi nửa thân xe). Kích thước phải tương đương.
-    Giải bài toán ghép cặp tối ưu bằng thuật toán Hungarian. Cách này hạn chế "nhảy ID" sang xe khác.
-    """
-
-    def __init__(self, max_dist, max_missed=8, diag=1000.0):
-        self.max_dist = max_dist
-        self.diag = diag
-        self.max_missed = max_missed
-        self.next_id = 1
-        self.tracks = {}
-
-    @staticmethod
-    def _center(b):
-        return np.array([b[0] + b[2] / 2, b[1] + b[3] / 2])
-
-    def update(self, boxes):
-        ids = list(self.tracks)
-        cents = [self._center(b) for b in boxes]
-        used_t, used_d = set(), set()
-        BIG = 1e9
-        if ids and boxes:
-            cost = np.full((len(ids), len(boxes)), BIG)
-            for r, i in enumerate(ids):
-                t = self.tracks[i]
-                k = min(t["missed"], 3) + 1
-                shift = t["v"] * k
-                tb = t["box"]
-                pb = (tb[0] + shift[0], tb[1] + shift[1], tb[2], tb[3])  # khung dự đoán
-                size = max(tb[2], tb[3])
-                for c, b in enumerate(boxes):
-                    ratio = (b[2] * b[3]) / max(1.0, tb[2] * tb[3])
-                    if not (0.33 <= ratio <= 3.0):
-                        continue  # kích thước khác hẳn ⇒ xe khác
-                    iou = box_iou(pb, b)
-                    if iou >= 0.05:
-                        cost[r, c] = 1.0 - iou
-                    else:
-                        dist = float(np.linalg.norm(t["c"] + shift - cents[c]))
-                        if dist <= min(0.5 * size * k, self.max_dist):
-                            cost[r, c] = 1.0 + dist / max(size, 1.0)
-            rows, cols = linear_sum_assignment(cost)
-            for r, c in zip(rows, cols):
-                if cost[r, c] >= BIG:
-                    continue
-                t = self.tracks[ids[r]]
-                step_v = (cents[c] - t["c"]) / (1 + t["missed"])
-                t["v"] = 0.6 * t["v"] + 0.4 * step_v if t["age"] > 1 else step_v
-                t.update(box=boxes[c], c=cents[c], missed=0, age=t["age"] + 1)
-                used_t.add(ids[r])
-                used_d.add(c)
-        for tid in ids:
-            if tid not in used_t:
-                self.tracks[tid]["missed"] += 1
-                if self.tracks[tid]["missed"] > self.max_missed:
-                    del self.tracks[tid]
-        for j, b in enumerate(boxes):
-            if j not in used_d:
-                self.tracks[self.next_id] = dict(box=b, c=cents[j], c0=cents[j], v=np.zeros(2), missed=0, age=1,
-                                                 moved=False, seen_before=False, done=False, violation=False,
-                                                 hist=deque(maxlen=60))
-                self.next_id += 1
-        return {tid: t for tid, t in self.tracks.items() if t["missed"] == 0}
-
-
-def vehicle_type(box, frame_area, car_area_pct):
-    """Ước lượng theo kích thước + tỉ lệ khung: xe máy thường hẹp và cao, ô tô rộng và to."""
-    area_pct = box[2] * box[3] / frame_area * 100
-    ratio = box[2] / max(box[3], 1)
-    if area_pct >= car_area_pct or (ratio >= 0.95 and area_pct >= 0.4 * car_area_pct):
-        return "Ô tô"
-    return "Xe máy"
-
-
-def draw_overlay(frame, line, light_rect, light_state, active, info_text, show_light=True):
-    img = frame.copy()
-    p1, p2 = line.pts()
-    line_color = BGR_RED if light_state == "RED" else BGR_YELLOW
-    cv2.line(img, p1, p2, line_color, 3)
-    cv2.putText(img, "VACH DUNG", (p1[0] + 5, p1[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, line_color, 2)
-    if show_light:
-        x0, y0, x1, y1 = light_rect
-        cv2.rectangle(img, (x0, y0), (x1, y1), STATE_COLOR[light_state], 2)
-        lbl = f"DEN {STATE_ASCII[light_state]}"
-        (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-        lx = min(x0, img.shape[1] - tw - 6)
-        ly = y0 - 6 if y0 - 6 >= th + 32 else y1 + th + 6  # tránh đè lên thanh thông tin phía trên
-        cv2.putText(img, lbl, (max(2, lx), ly), cv2.FONT_HERSHEY_SIMPLEX, 0.5, STATE_COLOR[light_state], 2)
-    for tid, t in active.items():
-        x, y, w, h = t["box"]
-        color = BGR_RED if t["violation"] else BGR_GREEN
-        cv2.rectangle(img, (x, y), (x + w, y + h), color, 3 if t["violation"] else 2)
-        label = f"ID {tid}" + (" VI PHAM" if t["violation"] else "")
-        (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-        cv2.putText(img, label, (max(2, min(x, img.shape[1] - tw - 4)), max(15, y - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        rp = tuple(int(v) for v in line.ref_point(t["box"]))
-        cv2.circle(img, rp, 4, color, -1)
-    (iw, _), _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
-    cv2.rectangle(img, (0, 0), (min(img.shape[1], iw + 16), 28), (20, 20, 20), -1)
-    cv2.putText(img, info_text, (8, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
-    return img
-
-
 def encode_jpg(img_bgr, quality=85):
     ok, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return buf.tobytes() if ok else None
@@ -748,216 +443,6 @@ def crop_box(frame, box, pad=0.25):
     px, py = int(w * pad), int(h * pad)
     H, W = frame.shape[:2]
     return frame[max(0, y - py):min(H, y + h + py), max(0, x - px):min(W, x + w + px)].copy()
-
-
-def analyze_frames(frames, cfg, fps_eff, background=None, progress=None, total=None, writer=None):
-    """Chạy toàn bộ pipeline A → B → C trên chuỗi khung hình.
-
-    frames: iterator trả về (thời_gian_giây, khung_BGR) đã cùng kích thước.
-    background: None = video (MOG2); ảnh nền = chế độ ảnh tĩnh.
-    """
-    results = dict(violations=[], timeline=[], annotated=[], n_frames=0, crossed_ok=0, skipped=0, moving_down=0, moving_up=0,
-                   light_sample=None, light_samples={}, vehicle_sample=None, vehicle_ids=set())
-    line = light_rect = detector = tracker = None
-    lights = LightTracker(cfg["light_mode"])
-    single_image = background is not None and total == 1
-    warmup = 0 if background is not None else max(5, int(fps_eff * 0.8))
-    margin = 3.0
-    cross_m = None  # ngưỡng trễ (hysteresis) quanh vạch, tính theo chiều cao khung hình
-
-    for i, (t_sec, frame) in enumerate(frames):
-        if line is None:
-            H, W = frame.shape[:2]
-            frame_area = float(H * W)
-            line = StopLine(cfg["line"], frame.shape, cfg["direction"])
-            light_rect = pct_rect_to_px(cfg["light_roi"], frame.shape)
-            min_area = cfg["min_area_pct"] / 100 * frame_area
-            max_area = cfg.get("max_area_pct", 20) / 100 * frame_area
-            diag = float(np.hypot(W, H))
-            max_dist = (0.35 if background is not None else 0.12 * max(1, cfg["frame_step"]) ** 0.5) * diag
-            tracker = VehicleTracker(max_dist=min(max_dist, 0.4 * diag), max_missed=max(8, int(1.5 * fps_eff)), diag=diag)
-            if background is None:
-                detector = VideoVehicleDetector(cfg["sensitivity"])
-
-        x0, y0, x1, y1 = light_rect
-        roi = frame[y0:y1, x0:x1]
-        state = lights.update(roi)
-        results["timeline"].append((round(t_sec, 2), state))
-        if roi.size and state not in results["light_samples"]:
-            results["light_samples"][state] = roi.copy()
-        if results["light_sample"] is None and state in ("RED", "GREEN", "YELLOW") and roi.size:
-            results["light_sample"] = roi.copy()
-
-        if background is None:
-            boxes, motion = detector.detect(frame, min_area, ignore_rect=light_rect, max_area=max_area)
-        else:
-            boxes, motion = detect_by_background(frame, background, min_area, cfg["sensitivity"],
-                                                 ignore_rect=light_rect, max_area=max_area)
-        # Quá nửa khung hình "chuyển động" ⇒ camera rung / chuyển cảnh / chữ phủ lên video: bỏ khung này.
-        shaky = i >= warmup and background is None and motion > 0.45
-        if shaky:
-            results["skipped"] += 1
-        if i < warmup or shaky:
-            boxes = []
-        boxes = merge_fragments(boxes, W, H, max_area)
-        active = tracker.update(boxes)
-        for tr in active.values():
-            tr["t_last"] = t_sec
-        for tid, tr in active.items():
-            if tr["age"] == 1 and "first_db" not in tr:
-                x_, y_, w_, h_ = tr["box"]
-                head = line.ref_point(tr["box"])
-                tail = (x_ + w_ / 2, y_)
-                tr["first_db"] = line.dist_before(head)
-                tr["box0"], tr["t0"] = tr["box"], t_sec
-                tr["first_tail_db"] = line.dist_before(tail)
-                # mảnh mới sinh ra đè lên một xe đã được xét ⇒ thừa hưởng kết quả, không tính lại
-                for other_id, other in active.items():
-                    if other_id != tid and other["age"] > 1 and other["done"] and same_vehicle(tr["box"], other["box"]):
-                        tr["done"], tr["violation"] = True, other["violation"]
-                        break
-
-        new_viol = []
-        replace_evidence = []  # (chỉ số bản ghi, id xe) — thay ảnh bằng chứng bằng khung xe đầy đủ hơn
-        for tid, tr in active.items():
-            ref = line.ref_point(tr["box"])
-            if not line.within(ref):
-                continue
-            db = line.dist_before(ref)
-            if single_image:
-                if db < -margin and state == "RED":
-                    tr["violation"] = True
-                    new_viol.append(tid)
-                continue
-            if cross_m is None:
-                cross_m = max(margin, 0.015 * H)
-            tr["max_db"] = max(tr.get("max_db", db), db)
-            tr["hist"].append((t_sec, db, float(tr["c"][0]), tr["box"][2], ref))
-            if db > cross_m:
-                tr["seen_before"] = True
-            # Quỹ đạo liền mạch: lần gần nhất xe còn ở TRƯỚC vạch phải cách đây ≤ 3 s và cùng làn
-            # (tâm xe lệch ngang không quá ~ một thân xe). Chặn trường hợp ID nhảy từ xe này sang xe khác.
-            continuous = False
-            for (th, dbh, cxh, wh, _) in reversed(tr["hist"]):
-                if dbh > cross_m:
-                    continuous = (t_sec - th <= 3.0
-                                  and abs(float(tr["c"][0]) - cxh) <= max(0.8 * max(wh, tr["box"][2]), 0.06 * W))
-                    break
-            # Xe đã từng ở trước vạch, HOẶC lúc mới xuất hiện thân xe đang nằm vắt qua vạch
-            # (xe có sẵn từ đầu cảnh / đi vào từ mép khung hình ngay sát vạch)
-            straddled = tr.get("first_tail_db", -1) > margin and tr.get("first_db", 0) < margin
-            # phải thực sự chạy qua vạch một đoạn, không phải khung xe "rung" qua lại quanh vạch khi xe đứng yên
-            progressed = tr["max_db"] - db > 0.05 * H
-            bx_, by_, bw_, bh_ = tr["box"]
-            # mảnh vụn (bóng, kính, mép xe) thường dẹt hoặc rất nhỏ ⇒ không đủ tư cách là "một xe"
-            vehicle_like = (bw_ * bh_ >= 1.5 * min_area and 0.3 <= bw_ / max(bh_, 1) <= 2.4
-                            and bh_ >= 0.035 * H)
-            if db < -cross_m and not tr["done"] and tr["age"] >= 3 and vehicle_like and progressed and (
-                    (tr["seen_before"] and continuous) or (straddled and tr["age"] <= 4 * fps_eff)):
-                tr["done"] = True
-                tr["t_cross"] = t_sec
-                recent = results.setdefault("_recent", [])
-                def _inside(p, q):  # tâm khung p nằm trong khung q
-                    cx__, cy__ = p[0] + p[2] / 2, p[1] + p[3] / 2
-                    return q[0] <= cx__ <= q[0] + q[2] and q[1] <= cy__ <= q[1] + q[3]
-                # trùng với một xe VỪA qua vạch (≤ 4 s) mà khung mới nằm trong / đè lên khung xe đó
-                dup_of = next((o for oid, o in active.items()
-                               if oid != tid and o["done"] and t_sec - o.get("t_cross", -99) <= 4.0
-                               and (box_iou(tr["box"], o["box"]) > 0.3 or _inside(tr["box"], o["box"]))), None)
-                dup = dup_of is not None
-                cx_, cy_ = tr["c"]
-                for t0, o in recent:  # o = xe đã qua vạch trước đó (giữ vị trí cuối cùng nhìn thấy)
-                    dt = t_sec - o.get("t_last", t0)
-                    # xe mới "mọc ra" đúng chỗ xe cũ vừa mất dấu ⇒ vẫn là chiếc xe đó (bị mất dấu rồi nhận lại)
-                    born = tr.get("t0", t_sec)
-                    if (o.get("t_last", t0) - 0.5 <= born <= o.get("t_last", t0) + 6.0
-                            and box_iou(tr.get("box0", tr["box"]), o["box"]) > 0.3):
-                        dup, dup_of = True, o
-                        break
-                    if t_sec - t0 > 4.0:
-                        continue
-                    reach = 0.8 * max(o["box"][2], o["box"][3]) + 0.12 * H * min(max(dt, 0), 2.0) + 0.04 * H
-                    if (box_iou(tr["box"], o["box"]) > 0.3 or _inside(tr["box"], o["box"])
-                            or np.hypot(cx_ - o["c"][0], cy_ - o["c"][1]) <= reach):
-                        dup, dup_of = True, o
-                        break
-                if dup and state == "RED" and dup_of is not None and dup_of.get("viol_idx") is not None:
-                    # bản ghi trước có thể là mảnh vụn của xe ⇒ nếu khung mới to hơn hẳn thì thay ảnh bằng chứng
-                    if tr["box"][2] * tr["box"][3] > 1.5 * dup_of["viol_area"]:
-                        replace_evidence.append((dup_of["viol_idx"], tid))
-                        dup_of["viol_area"] = tr["box"][2] * tr["box"][3]
-                recent.append((t_sec, tr))
-                if state == "RED":
-                    tr["violation"] = True
-                    if not dup:  # mảnh khác của cùng một xe vừa được ghi ⇒ không ghi thêm
-                        new_viol.append(tid)
-                        tr["viol_idx"] = len(results["violations"]) + len(new_viol) - 1
-                        tr["viol_area"] = tr["box"][2] * tr["box"][3]
-                    elif dup_of is not None:
-                        tr["viol_idx"], tr["viol_area"] = dup_of.get("viol_idx"), dup_of.get("viol_area", 0)
-                elif not dup:
-                    results["crossed_ok"] += 1
-
-        # Thống kê hướng di chuyển thực tế của xe (để phát hiện chọn nhầm hướng)
-        for tr in active.values():
-            if not tr["moved"] and line.within(tr["c"], tol=0.1):
-                dyy = tr["c"][1] - tr["c0"][1]
-                if abs(dyy) > 0.08 * H:
-                    tr["moved"] = True
-                    results["moving_down" if dyy > 0 else "moving_up"] += 1
-
-        for tid, tr in active.items():
-            if tr["age"] >= 2 or single_image:
-                results["vehicle_ids"].add(tid)
-            b = tr["box"]
-            if results["vehicle_sample"] is None or b[2] * b[3] > results["vehicle_sample"][1]:
-                results["vehicle_sample"] = (crop_box(frame, b, 0.05), b[2] * b[3])
-
-        n_viol = len(results["violations"]) + len(new_viol)
-        info = f"t={t_sec:5.1f}s | Den: {STATE_ASCII[state]} | Xe: {len(active)} | Vi pham: {n_viol}"
-        if i < warmup:
-            info = f"t={t_sec:5.1f}s | Dang hoc nen duong..."
-        elif shaky:
-            info = f"t={t_sec:5.1f}s | Camera rung / chuyen canh - bo qua khung"
-        out = draw_overlay(frame, line, light_rect, state, active, info)
-
-        for tid in new_viol:
-            b = active[tid]["box"]
-            ref = line.ref_point(b)
-            # ảnh bằng chứng: vẽ thêm đường đi của xe (điểm tiếp đất qua các khung) cắt qua vạch dừng
-            ev = out.copy()
-            pts = [(int(p[4][0]), int(p[4][1])) for p in active[tid].get("hist", [])]
-            if len(pts) >= 2:
-                cv2.polylines(ev, [np.array(pts, np.int32)], False, (0, 255, 255), 2, cv2.LINE_AA)
-                cv2.circle(ev, pts[0], 5, (0, 255, 255), -1)
-                cv2.arrowedLine(ev, pts[max(0, len(pts) - 4)], pts[-1], (0, 255, 255), 2, tipLength=0.5)
-            results["violations"].append({
-                "MaXe": f"ID-{tid:03d}",
-                "LoaiXe": vehicle_type(b, frame_area, cfg["car_area_pct"]) + " (ước lượng)",
-                "ThoiDiem": f"{t_sec:.1f} s",
-                "TrangThaiDen": STATE_VN[state],
-                "ViTri": f"Xe đã qua vạch tại ({int(ref[0])}, {int(ref[1])})",
-                "snapshot": encode_jpg(ev),
-                "crop": encode_jpg(crop_box(frame, b)),
-            })
-        for idx, tid in replace_evidence:
-            if 0 <= idx < len(results["violations"]) and tid in active:
-                b = active[tid]["box"]
-                results["violations"][idx].update(
-                    MaXe=f"ID-{tid:03d}", LoaiXe=vehicle_type(b, frame_area, cfg["car_area_pct"]) + " (ước lượng)",
-                    snapshot=encode_jpg(out), crop=encode_jpg(crop_box(frame, b)))
-
-        if writer is not None:
-            writer(out)
-        else:
-            results["annotated"].append(out)
-        results["n_frames"] += 1
-        if progress is not None and total:
-            progress.progress(min(1.0, (i + 1) / total), text=f"Đang xử lý khung {i + 1}/{total}")
-
-    results.pop("_recent", None)
-    results["n_vehicles"] = len(results["vehicle_ids"])
-    return results
 
 
 def open_video_writer(path, fps, size):
@@ -1111,119 +596,282 @@ def read_first_frame(video_path):
     return read_frame_at(video_path, 0.0)
 
 
+# ==========================================
+# NẠP MÔ HÌNH ĐÃ HUẤN LUYỆN TỪ NOTEBOOK
+# ==========================================
+@st.cache_resource(show_spinner="Đang nạp mô hình A, B, C từ notebook...")
+def load_system(path, mtime):
+    return HeThongCanhBao(path)
+
+
+@st.cache_data(show_spinner=False)
+def load_results(path, mtime):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+if not os.path.exists(MODEL_PATH):
+    st.error("Không tìm thấy **mo_hinh/he_thong_canh_bao.joblib**. Chép file này (notebook lưu ở mục E, nằm trong "
+             "`ket_qua_mo_hinh.zip`) vào thư mục `mo_hinh/` cạnh app.py rồi tải lại trang.")
+    st.stop()
+HT = load_system(MODEL_PATH, os.path.getmtime(MODEL_PATH))
+KQ = load_results(RESULT_PATH, os.path.getmtime(RESULT_PATH)) if os.path.exists(RESULT_PATH) else {}
+
+
+def _kq(path, default=None):
+    """Lấy một giá trị trong ket_qua_tong_hop.json theo đường dẫn 'A/test_macro_f1'."""
+    cur = KQ
+    for k in path.split("/"):
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def _ten_C():
+    return _kq("C_mo_hinh_ghep_xe/mo_hinh", "k-NN (k = 25)")
+
+
+def _auc_C():
+    for r in _kq("C_mo_hinh_ghep_xe/bang_ngoai_fold", []) or []:
+        if r.get("Mô hình C") == _ten_C():
+            return r.get("AUC cặp thật (ngoài fold)")
+    return None
+
+
+def _b_tim_test():
+    for r in _kq("B_tim_xe/test", []) or []:
+        if r.get("Phiên bản B") == HT.phien_ban_B:
+            return r
+    return None
+
+
+# Mô tả ba mô hình đang chạy, lấy đúng từ file joblib + ket_qua_tong_hop.json
+MODELS = {
+    "A": dict(ten="Nhận diện màu đèn", thuat_toan=_kq("A/mo_hinh", "k-NN"), cau_hinh=_kq("A/cau_hinh", "k=9, distance, manhattan"),
+              dac_trung="44 đặc trưng màu HSV của vùng đèn (chuẩn hóa StandardScaler)",
+              chi_so=[("Macro F1 (test)", _kq("A/test_macro_f1")), ("Recall đèn đỏ (test)", _kq("A/recall_den_do")),
+                      ("Accuracy (test)", _kq("A/test_accuracy"))]),
+    "B": dict(ten="Phát hiện xe", thuat_toan=_kq("B/mo_hinh", "SVM-RBF"), cau_hinh=_kq("B/cau_hinh", "C=10, γ=scale"),
+              dac_trung="HOG 64×64 (1.764 chiều) → PCA 150 thành phần, quét cửa sổ trượt quanh vạch dừng",
+              chi_so=[("F1 xe/nền (test)", _kq("B/test_f1")),
+                      ("F1 tìm xe trên frame (test)", (_b_tim_test() or {}).get("F1"))]),
+    "C": dict(ten="Theo dõi phương tiện", thuat_toan=_ten_C(), cau_hinh=f"ngưỡng {HT.nguong_C:g} + Hungarian ghép một-một",
+              dac_trung="21 đặc trưng của cặp khung xe ở hai frame liền nhau",
+              chi_so=[("AUC cặp thật (ngoài fold)", _auc_C())]),
+}
+
+
+DIR_UP = "Từ dưới lên ↑ · ra xa camera (như dữ liệu huấn luyện)"
+DIR_DOWN = "Từ trên xuống ↓ · về phía camera"
+
+
+# ==========================================
+# PIPELINE A → B → C → BƯỚC KẾT LUẬN (MÔ HÌNH THẬT CỦA NOTEBOOK)
+# ==========================================
+def to640(frame):
+    """Mô hình được huấn luyện trên ảnh 640×640 của dataset ⇒ mọi khung hình đều đưa về 640×640 trước khi vào A, B, C."""
+    return cv2.resize(frame, (640, 640), interpolation=cv2.INTER_AREA)
+
+
+def light_box_rel(light_roi_pct):
+    """(x, y, rộng, cao) % ⇒ (x1, y1, x2, y2) tỉ lệ 0..1, đúng dạng khung_den của notebook."""
+    x, y, w, h = light_roi_pct
+    return (x / 100, y / 100, min(1.0, (x + w) / 100), min(1.0, (y + h) / 100))
+
+
+def predict_light(frame, light_roi_pct):
+    """Mô hình A trên một khung hình: (trạng thái RED/YELLOW/GREEN, {lớp: xác suất})."""
+    lop, xs = HT.doan_den(to640(frame), light_box_rel(light_roi_pct))
+    return {"red_light": "RED", "yellow_light": "YELLOW", "green_light": "GREEN"}.get(lop, "UNKNOWN"), xs
+
+
+def scale_box(k, sx, sy):
+    return int(k[0] * sx), int(k[1] * sy), int(k[2] * sx), int(k[3] * sy)
+
+
+def draw_result(frame, cfg, r, info_text, tracks_bottom=None):
+    """Vẽ kết quả của một frame lên ảnh hiển thị (toạ độ mô hình 640×640 được đổi về kích thước ảnh)."""
+    img = frame.copy()
+    H, W = img.shape[:2]
+    sx, sy = W / 640, H / 640
+    ly = int(cfg["y_vach"] / 100 * H)
+    state = r["den"] if r else "UNKNOWN"
+    line_color = BGR_RED if state == "RED" else BGR_YELLOW
+    # dải B quét cửa sổ trượt (vạch − 20% … vạch + 15% chiều cao)
+    lo, hi = int(max(0, cfg["y_vach"] / 100 + HT.roi[0]) * H), int(min(1, cfg["y_vach"] / 100 + HT.roi[1]) * H)
+    band = img.copy()
+    cv2.rectangle(band, (0, lo), (W, hi), (56, 189, 248), -1)
+    img = cv2.addWeighted(band, 0.06, img, 0.94, 0)
+    cv2.line(img, (0, ly), (W, ly), line_color, 3)
+    cv2.putText(img, "VACH DUNG", (6, ly - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, line_color, 2)
+    if cfg["light_mode"] == "auto":
+        x0, y0, x1, y1 = pct_rect_to_px(cfg["light_roi"], img.shape)
+        cv2.rectangle(img, (x0, y0), (x1, y1), STATE_COLOR[state], 2)
+        lbl = f"A: {STATE_ASCII[state]}"
+        (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        ty = y0 - 6 if y0 - 6 >= th + 32 else y1 + th + 6
+        cv2.putText(img, lbl, (max(2, min(x0, W - tw - 6)), ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, STATE_COLOR[state], 2)
+    if r:
+        for k in r["K"]:                                    # khung B tìm (mảnh)
+            x0, y0, x1, y1 = scale_box(k, sx, sy)
+            cv2.rectangle(img, (x0, y0), (x1, y1), (80, 210, 60), 1)
+        canh_ids = {c["id"] for c in r["canh_bao"]}
+        for g in r["giu"]:                                  # xe C ghép giữa hai frame (đậm), có ID
+            x0, y0, x1, y1 = scale_box(g["khung_b"], sx, sy)
+            bad = g["id"] in canh_ids or g["id"] in (tracks_bottom or {}).get("_viol", set())
+            color = BGR_RED if bad else BGR_GREEN
+            cv2.rectangle(img, (x0, y0), (x1, y1), color, 4 if bad else 2)
+            label = f"ID {g['id']}" + (" VUOT DEN DO" if bad else "")
+            (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            cv2.putText(img, label, (max(2, min(x0, W - tw - 4)), max(15, y0 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            pts = (tracks_bottom or {}).get(g["id"], [])
+            if len(pts) >= 2:                               # quỹ đạo đáy khung (đầu ra ID + quỹ đạo của C)
+                arr = np.array([(int(p[0] * sx), int(p[1] * sy)) for _, p in pts[-12:]], np.int32)
+                cv2.polylines(img, [arr], False, (0, 255, 255), 2, cv2.LINE_AA)
+    (iw, _), _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
+    cv2.rectangle(img, (0, 0), (min(W, iw + 16), 28), (20, 20, 20), -1)
+    cv2.putText(img, info_text, (8, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
+    return img
+
+
+def analyze_sequence(frames, cfg, total, progress=None, writer=None):
+    """Chạy hệ thống trên chuỗi khung hình (giống chay_video của notebook).
+
+    frames: iterator (thời_gian_giây, khung_BGR đã cùng kích thước hiển thị).
+    Mỗi frame: A đọc đèn → B quét cửa sổ trượt quanh vạch → C ghép xe với frame trước (Hungarian)
+    → xe C ghép đi qua vạch khi A báo đỏ ⇒ cảnh báo (mỗi ID một lần).
+    """
+    bt = BoTheoDoi(HT, cfg["y_vach"] / 100,
+                   light_box_rel(cfg["light_roi"]) if cfg["light_mode"] == "auto" else None,
+                   che_do_den=cfg["light_mode"], xe_di_len=cfg["direction"] == "up",
+                   nguong_xe=cfg["nguong_xe"], nguong_C=cfg["nguong_C"], lam_muot=cfg["lam_muot"])
+    res = dict(violations=[], timeline=[], annotated=[], n_frames=0, crossed_ok=0, light_samples={},
+               light_sample=None, vehicle_sample=None, n_boxes=0, n_windows=0, t_model=0.0, p_light=[])
+    viol_ids = set()
+    t_start = time.time()
+    for i, (t_sec, frame) in enumerate(frames):
+        t0 = time.time()
+        r = bt.buoc(to640(frame), t_sec)
+        res["t_model"] += time.time() - t0
+        res["timeline"].append((round(t_sec, 2), r["den"]))
+        res["p_light"].append((round(t_sec, 2), r["xac_suat_den"]))
+        res["crossed_ok"] += r["vuot_hop_le"]
+        res["n_boxes"] += len(r["K"])
+        res["n_windows"] = r["so_cua_so"]
+        H, W = frame.shape[:2]
+        sx, sy = W / 640, H / 640
+        if cfg["light_mode"] == "auto":
+            x0, y0, x1, y1 = pct_rect_to_px(cfg["light_roi"], frame.shape)
+            roi = frame[y0:y1, x0:x1]
+            if roi.size and r["den"] not in res["light_samples"]:
+                res["light_samples"][r["den"]] = roi.copy()
+            if res["light_sample"] is None and r["den"] in ("RED", "GREEN", "YELLOW") and roi.size:
+                res["light_sample"] = roi.copy()
+        for k in r["K"]:
+            area = (k[2] - k[0]) * (k[3] - k[1])
+            if res["vehicle_sample"] is None or area > res["vehicle_sample"][1]:
+                x0, y0, x1, y1 = scale_box(k, sx, sy)
+                crop = frame[max(0, y0):y1, max(0, x0):x1]
+                if crop.size:
+                    res["vehicle_sample"] = (crop.copy(), area)
+        for c in r["canh_bao"]:
+            viol_ids.add(c["id"])
+        tracks = dict(bt.quy_dao)
+        tracks["_viol"] = viol_ids
+        info = (f"t={t_sec:5.1f}s | A: den {STATE_ASCII[r['den']]} | B: {len(r['K'])} xe | "
+                f"C: {len(r['giu'])} cap | Canh bao: {len(res['violations']) + len(r['canh_bao'])}")
+        out = draw_result(frame, cfg, r, info, tracks)
+        for c in r["canh_bao"]:
+            x0, y0, x1, y1 = scale_box(c["khung_b"], sx, sy)
+            ev = out.copy()
+            pts = bt.quy_dao.get(c["id"], [])
+            if len(pts) >= 2:
+                arr = np.array([(int(p[0] * sx), int(p[1] * sy)) for _, p in pts], np.int32)
+                cv2.polylines(ev, [arr], False, (0, 255, 255), 2, cv2.LINE_AA)
+                cv2.arrowedLine(ev, tuple(arr[-2]), tuple(arr[-1]), (0, 255, 255), 2, tipLength=0.5)
+            p_do = r["xac_suat_den"].get("red_light")
+            res["violations"].append({
+                "MaXe": f"ID-{c['id']:03d}",
+                "ThoiDiem": f"{t_sec:.1f} s",
+                "TrangThaiDen": STATE_VN[r["den"]],
+                "XacSuatDo": None if p_do is None else float(p_do),
+                "XacSuatCungXe": float(c["p_C"]),
+                "DiemXe": float(c["p_b"]),
+                "ViTri": f"Đáy khung qua vạch tại ({int((c['khung_b'][0] + c['khung_b'][2]) / 2 * sx)}, {int(c['khung_b'][3] * sy)})",
+                "snapshot": encode_jpg(ev),
+                "crop": encode_jpg(crop_box(frame, (x0, y0, x1 - x0, y1 - y0))),
+            })
+        if writer is not None:
+            writer(out)
+        else:
+            res["annotated"].append(out)
+        res["n_frames"] += 1
+        if progress is not None and total:
+            el = time.time() - t_start
+            eta = el / (i + 1) * (total - i - 1)
+            progress.progress(min(1.0, (i + 1) / total),
+                              text=f"Đang xử lý frame {i + 1}/{total} · còn khoảng {eta:.0f} giây "
+                                   f"(B quét {r['so_cua_so']:,} cửa sổ / frame bằng SVM-RBF)")
+    res["n_vehicles"] = bt.next_id - 1
+    return res
+
+
 def analyze_video(video_path, cfg, progress, start=0.0, end=None, box=None):
+    """Lấy frame cách nhau `buoc_giay` giây (giống tham số buoc_giay của chay_video trong notebook)."""
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     if fps <= 1 or fps > 240:
         fps = 25.0
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    step = max(1, cfg["frame_step"])
-    start_idx = int(round(start * fps))
-    stop_idx = start_idx + int(fps * cfg["max_seconds"])
-    if end is not None:
-        stop_idx = min(stop_idx, int(round(end * fps)))
-    if n_total > 0:
-        stop_idx = min(stop_idx, n_total)
-    n_proc = max(1, (stop_idx - start_idx) // step)
-    fps_eff = fps / step
-
-    if start_idx:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+    end_t = end if end is not None else (n_total / fps if n_total else start + cfg["buoc_giay"] * cfg["max_frames"])
+    wanted = sorted({int(round(t * fps)) for t in np.arange(start, end_t + 1e-9, cfg["buoc_giay"])})[:cfg["max_frames"]]
+    if not wanted:
+        cap.release()
+        return None
+    cap.set(cv2.CAP_PROP_POS_FRAMES, wanted[0])
     ok, first = cap.read()
     if not ok:
         cap.release()
         return None
     first = resize_frame(crop_rel(first, box))
     size = (first.shape[1], first.shape[0])
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+    want = set(wanted)
 
     def gen():
-        idx = start_idx
-        while idx < stop_idx:
-            ok, f = cap.read()
-            if not ok:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, wanted[0])
+        idx, got = wanted[0], 0
+        while got < len(wanted):
+            ok_, f = cap.read()
+            if not ok_:
                 break
-            if (idx - start_idx) % step == 0:
+            if idx in want:
+                got += 1
                 yield idx / fps, resize_frame(crop_rel(f, box), size)
             idx += 1
 
+    out_fps = max(1.0, min(4.0, 1.0 / cfg["buoc_giay"]))
     out_path = os.path.join(tempfile.mkdtemp(), "ket_qua.mp4")
-    write, close, browser_ok = open_video_writer(out_path, fps_eff, size)
+    write, close, browser_ok = open_video_writer(out_path, out_fps, size)
     try:
-        res = analyze_frames(gen(), cfg, fps_eff, progress=progress, total=n_proc, writer=write)
+        res = analyze_frames_wrap(gen(), cfg, len(wanted), progress, write)
     finally:
         close()
         cap.release()
     with open(out_path, "rb") as fh:
         res["video_bytes"] = fh.read()
     res["video_browser_ok"] = browser_ok
-    res["duration"] = res["n_frames"] / fps_eff
+    res["duration"] = (wanted[min(res["n_frames"], len(wanted)) - 1] - wanted[0]) / fps if res["n_frames"] else 0.0
     return res
+
+
+def analyze_frames_wrap(frames, cfg, total, progress, writer=None):
+    return analyze_sequence(frames, cfg, total, progress=progress, writer=writer)
 
 
 def decode_upload_image(uploaded):
     data = np.frombuffer(uploaded.getvalue(), np.uint8)
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
-
-
-# ==========================================
-# CẢNH MÔ PHỎNG (SYNTHETIC SCENE)
-# ==========================================
-def generate_traffic_scene(scenario_type, frame_idx=1, stop_y=320):
-    width, height = 640, 480
-    img = np.zeros((height, width, 3), dtype=np.uint8)
-    img[0:height, :] = (45, 52, 54)
-    for y in range(0, height, 40):
-        cv2.line(img, (width // 2, y), (width // 2, y + 20), (255, 255, 255), 2)
-    cv2.rectangle(img, (0, 0), (60, height), (100, 110, 120), -1)
-    cv2.rectangle(img, (580, 0), (640, height), (100, 110, 120), -1)
-    cv2.rectangle(img, (510, 40), (560, 180), (30, 30, 30), -1)
-    cv2.rectangle(img, (510, 40), (560, 180), (200, 200, 200), 2)
-
-    if "Đèn Xanh" in scenario_type:
-        light_state = "GREEN"
-        c_red, c_yellow, c_green = (50, 0, 0), (50, 50, 0), (0, 255, 0)
-    else:
-        light_state = "RED"
-        c_red, c_yellow, c_green = (0, 0, 255), (50, 50, 0), (0, 50, 0)
-    cv2.circle(img, (535, 70), 16, c_red, -1)
-    cv2.circle(img, (535, 110), 16, c_yellow, -1)
-    cv2.circle(img, (535, 150), 16, c_green, -1)
-
-    cv2.line(img, (60, stop_y), (580, stop_y), (0, 255, 255), 4)
-    cv2.putText(img, "VACH DUNG (STOP LINE)", (70, stop_y - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
-
-    vehicles = []
-    if "Xe máy Vượt Vạch" in scenario_type:
-        y1 = 260 if frame_idx == 1 else 360
-        vehicles.append({"id": "XE-01", "type": "motobike", "bbox": [180, y1, 70, 80], "color": (255, 105, 180)})
-        vehicles.append({"id": "XE-02", "type": "car", "bbox": [340, 200, 120, 90], "color": (50, 205, 50)})
-    elif "Ô tô Dừng Đúng Quy Định" in scenario_type:
-        vehicles.append({"id": "XE-01", "type": "car", "bbox": [160, 210, 110, 85], "color": (30, 144, 255)})
-        vehicles.append({"id": "XE-02", "type": "motobike", "bbox": [360, 230, 65, 75], "color": (255, 165, 0)})
-    else:
-        y_m = 220 if frame_idx == 1 else 350
-        y_c = 180 if frame_idx == 1 else 290
-        vehicles.append({"id": "XE-01", "type": "motobike", "bbox": [180, y_m, 70, 80], "color": (0, 215, 255)})
-        vehicles.append({"id": "XE-02", "type": "car", "bbox": [330, y_c, 115, 90], "color": (147, 112, 219)})
-
-    violations = []
-    for v in vehicles:
-        x, y, w, h = v["bbox"]
-        cv2.rectangle(img, (x, y), (x + w, y + h), v["color"], -1)
-        cv2.rectangle(img, (x, y), (x + w, y + h), (255, 255, 255), 2)
-        is_violation = False
-        if frame_idx == 2 and light_state == "RED" and (y + h) > stop_y + 10:
-            is_violation = True
-            violations.append({
-                "MaXe": v["id"], "LoaiXe": v["type"], "ThoiDiem": datetime.now().strftime("%H:%M:%S - %d/%m/%Y"),
-                "TrangThaiDen": "Đỏ", "ViTri": f"Y={y + h} (Vượt vạch {stop_y})",
-            })
-        box_color = (0, 0, 255) if is_violation else (0, 255, 0)
-        label = f"{v['id']} ({v['type']}) - VI PHAM!" if is_violation else f"{v['id']} ({v['type']})"
-        cv2.rectangle(img, (x, y), (x + w, y + h), box_color, 3)
-        cv2.putText(img, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-    return img, light_state, violations
 
 
 # ==========================================
@@ -1304,6 +952,10 @@ def light_timeline_fig(timeline, violations):
     return fig
 
 
+def fmt(v, nd=3):
+    return "—" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:.{nd}f}"
+
+
 # ==========================================
 # SIDEBAR
 # ==========================================
@@ -1314,76 +966,78 @@ with st.sidebar:
         <div><div class="t">Giám sát vượt đèn đỏ</div><div class="s">Đồ án Học Máy Truyền Thống · Nhóm 6</div></div>
     </div>""", unsafe_allow_html=True)
 
-    st.markdown('<div class="sb-sec">Thuật toán cho từng mô hình</div>', unsafe_allow_html=True)
-    sel_model_a = st.selectbox("Mô hình A · Nhận diện đèn", list(MODEL_PERFORMANCE["Model_A"].keys()))
-    sel_model_b = st.selectbox("Mô hình B · Phát hiện xe", list(MODEL_PERFORMANCE["Model_B"].keys()))
-    sel_model_c = st.selectbox("Mô hình C · Ghép cặp xe", list(MODEL_PERFORMANCE["Model_C"].keys()))
-    perf_a = MODEL_PERFORMANCE["Model_A"][sel_model_a]
-    perf_b = MODEL_PERFORMANCE["Model_B"][sel_model_b]
-    perf_c = MODEL_PERFORMANCE["Model_C"][sel_model_c]
-    avg_acc = round((perf_a["accuracy"] + perf_b["accuracy"] + perf_c["accuracy"]) / 3, 1)
-    total_latency = round(sum(float(p["latency"].split()[0]) for p in (perf_a, perf_b, perf_c)), 1)
-    st.markdown(f"""
-    <div class="sb-sum">
-        <div class="row"><span>Độ chính xác trung bình</span><b style="color:{C_GREEN}">{avg_acc}%</b></div>
-        <div class="row"><span>Tổng độ trễ</span><b style="color:{C_ACCENT}">{total_latency} ms</b></div>
-    </div>""", unsafe_allow_html=True)
+    st.markdown('<div class="sb-sec">Mô hình đang chạy (từ notebook)</div>', unsafe_allow_html=True)
+    rows_html = "".join(
+        f'<div class="row"><span>{k} · {m["ten"]}</span><b>{m["thuat_toan"]}</b></div>'
+        f'<div class="row" style="padding-top:0"><span style="color:{C_DIM};font-size:.78rem">{m["cau_hinh"]}</span>'
+        f'<b style="color:{C_GREEN};font-size:.8rem">{fmt(m["chi_so"][0][1])}</b></div>'
+        for k, m in MODELS.items())
+    st.markdown(f'<div class="sb-sum">{rows_html}</div>', unsafe_allow_html=True)
+    st.caption("Số xanh lá: macro F1 test (A), F1 xe/nền test (B), AUC ngoài fold (C). "
+               "Chỉ các mô hình được chọn ở notebook mới được lưu vào file joblib, nên web chạy đúng bộ này.")
 
-    st.markdown('<div class="sb-sec">Tab mô phỏng</div>', unsafe_allow_html=True)
-    scenario = st.selectbox("Kịch bản kiểm thử", [
-        "Kịch bản 1: Đèn Đỏ - Xe máy Vượt Vạch (Vi Phạm)",
-        "Kịch bản 2: Đèn Đỏ - Ô tô Dừng Đúng Quy Định",
-        "Kịch bản 3: Đèn Xanh - Lưu Thông Bình Thường",
-    ], format_func=lambda s: s.split(": ", 1)[1])
-    stop_line_y = st.slider("Vị trí vạch dừng (trục Y)", 200, 400, 320)
+    st.markdown('<div class="sb-sec">Ngưỡng của hệ thống</div>', unsafe_allow_html=True)
+    nguong_xe = st.slider("Ngưỡng B (xác suất là xe)", 0.5, 0.99, float(HT.nguong_xe), 0.01,
+                          help=f"Notebook chọn {HT.nguong_xe:g} trên tập val. Chỉ ảnh hưởng khung B hiển thị; "
+                               f"C luôn nhận mọi khung có điểm ≥ {HT.nguong_vao_C:g} như notebook.")
+    nguong_C = st.slider("Ngưỡng C (xác suất cùng một xe)", 0.1, 0.9, float(HT.nguong_C), 0.05,
+                         help=f"Notebook chọn {HT.nguong_C:g} theo F1 vượt vạch ngoài fold trên train.")
+    lam_muot = st.slider("Bỏ phiếu màu đèn trên N frame (D1)", 1, 5, 3,
+                         help="Màu đèn = đa số của N frame gần nhất (LAM_MUOT_A = 3 trong notebook).")
+    if (nguong_xe, nguong_C, lam_muot) != (HT.nguong_xe, HT.nguong_C, 3):
+        st.caption("⚠ Đang khác cấu hình notebook: số liệu đánh giá ở tab Hiệu năng không còn áp dụng.")
 
 
 # ==========================================
 # HEADER
 # ==========================================
-st.markdown("""
+st.markdown(f"""
 <div class="hero">
     <div class="hero-left">
         <div class="tl-icon"><span class="r"></span><span class="y"></span><span class="g"></span></div>
         <div>
             <h1>Phát hiện & cảnh báo xe vượt đèn đỏ</h1>
-            <p>Pipeline máy học truyền thống chạy trên ảnh và video thật từ camera giao thông</p>
+            <p>Chạy đúng ba mô hình máy học truyền thống đã huấn luyện trong notebook, không dùng học sâu</p>
         </div>
     </div>
     <div class="chips">
-        <span class="chip">Đèn · <b>HSV</b></span>
-        <span class="chip">Xe · <b>MOG2 + HOG</b></span>
-        <span class="chip">Ghép cặp · <b>Hungarian</b></span>
+        <span class="chip">A · <b>{MODELS['A']['thuat_toan']}</b> trên HSV</span>
+        <span class="chip">B · <b>{MODELS['B']['thuat_toan']}</b> trên HOG+PCA</span>
+        <span class="chip">C · <b>{MODELS['C']['thuat_toan']}</b> + Hungarian</span>
     </div>
 </div>
 """, unsafe_allow_html=True)
 
+
+def _stage(k, color, m):
+    name, val = m["chi_so"][0]
+    return (f'<div class="stage" style="--c:{color}"><div class="k">Mô hình {k} · {m["ten"]}</div>'
+            f'<div class="v">{m["thuat_toan"]}</div><div class="s">{name} <b>{fmt(val)}</b></div></div>')
+
+
 st.markdown(f"""
 <div class="strip">
-    <div class="stage" style="--c:{C_ACCENT}"><div class="k">Mô hình A · Đèn</div>
-        <div class="v">{sel_model_a}</div><div class="s">Accuracy <b>{perf_a['accuracy']}%</b> · {perf_a['latency']}</div></div>
-    <div class="stage" style="--c:#A78BFA"><div class="k">Mô hình B · Phát hiện xe</div>
-        <div class="v">{sel_model_b}</div><div class="s">Accuracy <b>{perf_b['accuracy']}%</b> · {perf_b['latency']}</div></div>
-    <div class="stage" style="--c:#F472B6"><div class="k">Mô hình C · Ghép cặp xe</div>
-        <div class="v">{sel_model_c}</div><div class="s">Accuracy <b>{perf_c['accuracy']}%</b> · {perf_c['latency']}</div></div>
+    {_stage("A", C_ACCENT, MODELS["A"])}
+    {_stage("B", "#A78BFA", MODELS["B"])}
+    {_stage("C", "#F472B6", MODELS["C"])}
     <div class="stage" style="--c:{C_RED}"><div class="k">Nhật ký vi phạm</div>
         <div class="v">{len(st.session_state.violations_log)} lượt</div><div class="s">Lưu trong phiên làm việc này</div></div>
 </div>
 """, unsafe_allow_html=True)
 
-tab_real, tab_sim, tab_bench, tab_feat, tab_log = st.tabs([
-    "Phân tích ảnh / video", "Mô phỏng pipeline", "Hiệu năng mô hình", "Đặc trưng HSV & HOG", "Nhật ký vi phạm",
+tab_real, tab_bench, tab_feat, tab_log = st.tabs([
+    "Phân tích ảnh / video", "Hiệu năng mô hình", "Đặc trưng A & B", "Nhật ký vi phạm",
 ])
 
 # ==========================================
-# TAB 1: PHÂN TÍCH ẢNH / VIDEO THẬT
+# TAB 1: PHÂN TÍCH ẢNH / VIDEO
 # ==========================================
 with tab_real:
-    step(1, "Dữ liệu đầu vào", "Video hoặc ảnh từ camera đặt cố định tại ngã tư")
+    step(1, "Dữ liệu đầu vào", "Video hoặc chuỗi ảnh từ camera đặt cố định tại ngã tư")
     input_type = st.segmented_control("Loại dữ liệu", ["🎥 Video", "🖼️ Ảnh"], default="🎥 Video",
                                       label_visibility="collapsed") or "🎥 Video"
-    preview, source_key, video_path, images, background = None, None, None, [], None
-    has_sample = os.path.exists(SAMPLE_VIDEO)
+    preview, source_key, video_path, images = None, None, None, []
+    samples_avail = [p for p in (NOTEBOOK_SAMPLE, SAMPLE_VIDEO) if os.path.exists(p)]
 
     if input_type == "🎥 Video":
         up = st.file_uploader("Tải video lên", type=["mp4", "avi", "mov", "mkv", "m4v"],
@@ -1398,10 +1052,11 @@ with tab_real:
                 st.session_state.video_key = source_key
                 st.session_state.video_path = tmp.name
             video_path = st.session_state.video_path
-        elif st.session_state.use_sample and has_sample:
-            source_key, video_path = "vid:video_thu.mp4:sample", SAMPLE_VIDEO
+        elif st.session_state.use_sample and st.session_state.get("sample_path") in samples_avail:
+            video_path = st.session_state.sample_path
+            source_key = f"vid:{os.path.basename(video_path)}:sample"
             c_s1, c_s2 = st.columns([4, 1])
-            c_s1.caption("Đang dùng **video mẫu** (video_thu.mp4). Tải video của bạn lên để thay thế.")
+            c_s1.caption(f"Đang dùng **video mẫu** ({os.path.basename(video_path)}). Tải video của bạn lên để thay thế.")
             if c_s2.button("Bỏ video mẫu", width="stretch"):
                 st.session_state.use_sample = False
                 st.rerun()
@@ -1441,23 +1096,19 @@ with tab_real:
                 if not full:
                     st.caption("Đã tự cắt bỏ viền đen / chữ tiêu đề quanh hình camera.")
                 if scene["moving"]:
-                    banner("<b>Camera trong cảnh này đang zoom hoặc lia.</b> Phương pháp trừ nền chỉ đúng với camera đứng yên, "
-                           "nên kết quả cảnh này sẽ không đáng tin (xe bị cắt thành nhiều mảnh, báo vi phạm nhầm). "
-                           "Nên chọn cảnh khác.", good="warn")
-                # Hướng xe: tự điền theo ước lượng optical flow cho mỗi cảnh mới (người dùng vẫn đổi được)
+                    banner("<b>Camera trong cảnh này đang zoom hoặc lia.</b> Vạch dừng khai báo một lần cho cả đoạn nên "
+                           "sẽ lệch khỏi vạch thật khi camera chuyển động. Nên chọn cảnh khác.", good="warn")
                 if scene["direction"] and st.session_state.get("dir_applied_for") != source_key:
-                    st.session_state.direction = "Từ trên xuống ↓" if scene["direction"] == "down" else "Từ dưới lên ↑"
+                    st.session_state.direction = DIR_UP if scene["direction"] == "up" else DIR_DOWN
                     st.session_state.dir_applied_for = source_key
                 st.session_state.dir_guess = (scene["direction"], scene["conf"])
                 if preview is None:
                     banner("Không đọc được khung hình của cảnh này.", good=False)
     else:
-        c_i1, c_i2 = st.columns(2)
-        ups = c_i1.file_uploader("Ảnh cần kiểm tra (1 ảnh hoặc nhiều ảnh liên tiếp, cùng góc camera)",
-                                 type=["jpg", "jpeg", "png", "bmp", "webp"], accept_multiple_files=True)
-        bg_up = c_i2.file_uploader("Ảnh nền: cùng góc camera nhưng đường trống",
-                                   type=["jpg", "jpeg", "png", "bmp", "webp"],
-                                   help="Bắt buộc nếu chỉ có 1–2 ảnh. Từ 3 ảnh trở lên, hệ thống tự ước lượng nền.")
+        ups = st.file_uploader("Ảnh cần kiểm tra: 1 ảnh, hoặc nhiều ảnh liên tiếp cùng góc camera (sắp theo tên file)",
+                               type=["jpg", "jpeg", "png", "bmp", "webp"], accept_multiple_files=True,
+                               help="Từ 2 ảnh trở lên, mô hình C ghép xe giữa từng cặp ảnh liền nhau để biết xe có đi qua "
+                                    "vạch không (giống hàm chay_anh_thuc_te của notebook). 1 ảnh: chỉ chạy A và B.")
         if ups:
             ups = sorted(ups, key=lambda f: f.name)
             decoded = [decode_upload_image(u) for u in ups]
@@ -1467,47 +1118,52 @@ with tab_real:
                 first = resize_frame(decoded[0])
                 size = (first.shape[1], first.shape[0])
                 images = [first] + [resize_frame(d, size) for d in decoded[1:]]
-                if bg_up is not None and decode_upload_image(bg_up) is not None:
-                    background = resize_frame(decode_upload_image(bg_up), size)
-                elif len(images) >= 3:
-                    background = np.median(np.stack(images), axis=0).astype(np.uint8)
                 preview = images[0]
-                source_key = "img:" + "|".join(f"{u.name}:{u.size}" for u in ups) + (f"|bg:{bg_up.name}" if bg_up else "")
+                source_key = "img:" + "|".join(f"{u.name}:{u.size}" for u in ups)
 
     if preview is None:
         st.markdown("""
         <div class="empty">
             <div class="big">🚦</div>
             <h4>Chưa có dữ liệu</h4>
-            <p>Tải lên một video quay ngã tư từ camera cố định. Hệ thống sẽ đọc màu đèn, tìm từng phương tiện,
-            theo dõi chúng qua các khung hình và đánh dấu xe nào vượt vạch dừng khi đèn đỏ.</p>
+            <p>Tải lên video quay ngã tư từ camera cố định. Mô hình A đọc màu đèn, mô hình B tìm xe quanh vạch dừng,
+            mô hình C ghép cùng một xe giữa các frame, rồi bước kết luận đánh dấu xe đi qua vạch khi đèn đỏ.</p>
         </div>""", unsafe_allow_html=True)
-        if input_type == "🎥 Video" and has_sample:
-            _, mid, _ = st.columns([2, 1.2, 2])
-            if mid.button("▶  Thử với video mẫu", type="primary", width="stretch"):
-                st.session_state.use_sample = True
-                # video mẫu: đèn ở góc phải, vạch dừng ở 65% chiều cao — cấu hình sẵn để demo ngay
-                st.session_state.pending_cfg = dict(rx=87, ry=3, rw=7, rh=30, lx1=5, ly1=65, lx2=95, ly2=65,
-                                                    light_mode="auto")
-                st.session_state.light_confirmed_for = "vid:video_thu.mp4:sample"
-                st.rerun()
+        if input_type == "🎥 Video" and samples_avail:
+            st.write("")
+            cols_s = st.columns([1] + [1.2] * len(samples_avail) + [1])
+            for j, p in enumerate(samples_avail):
+                is_nb = p == NOTEBOOK_SAMPLE
+                lbl = "▶  Video test của notebook" if is_nb else "▶  Thử với video mẫu"
+                if cols_s[j + 1].button(lbl, type="primary" if j == 0 else "secondary", width="stretch", key=f"sample_{j}"):
+                    st.session_state.use_sample = True
+                    st.session_state.sample_path = p
+                    key_ = f"vid:{os.path.basename(p)}:sample"
+                    if is_nb:   # vạch dừng và khung đèn khai báo như notebook mục F1 (y ≈ 0,42; đèn ở góc phải)
+                        st.session_state.pending_cfg = dict(rx=70, ry=15, rw=2, rh=5, ly=42, light_mode="auto",
+                                                            buoc_giay=0.5, direction=DIR_UP)
+                    else:
+                        st.session_state.pending_cfg = dict(rx=87, ry=3, rw=7, rh=30, ly=65, light_mode="auto")
+                    st.session_state.sample_confirmed = key_      # cấu hình sẵn đúng cho mọi cảnh của video mẫu
+                    st.session_state.dir_applied_for = key_
+                    st.rerun()
         st.write("")
-        st.markdown("""
+        st.markdown(f"""
         <div class="flow">
-            <div><b>① Mô hình A</b>Đọc màu đèn trong vùng đèn theo ngưỡng màu HSV.</div>
-            <div><b>② Mô hình B</b>Tách xe khỏi nền đường bằng trừ nền MOG2 + contour.</div>
-            <div><b>③ Mô hình C</b>Ghép cùng một xe giữa các khung hình bằng thuật toán Hungarian.</div>
-            <div><b>④ Kết luận</b>Đầu xe đi từ trước vạch sang sau vạch khi đèn đỏ ⇒ vi phạm.</div>
+            <div><b>① Mô hình A · {MODELS['A']['thuat_toan']}</b>44 đặc trưng màu HSV của vùng đèn → đỏ / vàng / xanh.</div>
+            <div><b>② Mô hình B · {MODELS['B']['thuat_toan']}</b>Cửa sổ trượt quanh vạch dừng, HOG → PCA 150 → xe hay nền.</div>
+            <div><b>③ Mô hình C · {MODELS['C']['thuat_toan']}</b>21 đặc trưng cặp khung → cùng một xe? Hungarian ghép một-một, ra ID.</div>
+            <div><b>④ Bước kết luận</b>Xe C ghép có đáy khung đi qua vạch dừng khi A báo đỏ ⇒ cảnh báo.</div>
         </div>""", unsafe_allow_html=True)
 
     else:
-        step(2, "Hiệu chỉnh trên hình", "Bấm trực tiếp lên ảnh để chọn đèn và vẽ vạch dừng")
+        step(2, "Hiệu chỉnh trên hình", "Bấm trực tiếp lên ảnh để chọn đèn và đặt vạch dừng")
 
-        # Giá trị mặc định + áp dụng thay đổi từ lần bấm chuột trước (phải làm trước khi tạo thanh trượt)
-        for k_, v_ in dict(lx1=5, ly1=65, lx2=95, ly2=65, rx=85, ry=5, rw=10, rh=25).items():
+        for k_, v_ in dict(ly=65, rx=85, ry=5, rw=10, rh=25).items():
             st.session_state.setdefault(k_, v_)
         st.session_state.setdefault("light_mode", "auto")
-        st.session_state.setdefault("line_first_pt", None)
+        st.session_state.setdefault("buoc_giay", 0.3)
+        st.session_state.setdefault("direction", DIR_UP)
         st.session_state.cur_source = source_key
 
         def _confirm_light():  # người dùng tự kéo thanh trượt vùng đèn ⇒ coi như đã chọn đèn
@@ -1521,36 +1177,33 @@ with tab_real:
         with col_cfg:
             with st.container(border=True):
                 tool = st.segmented_control(
-                    "Công cụ bấm trên ảnh", ["🚦 Chọn đèn", "📏 Vẽ vạch dừng"], default="🚦 Chọn đèn", key="tool",
+                    "Công cụ bấm trên ảnh", ["🚦 Chọn đèn", "📏 Đặt vạch dừng"], default="🚦 Chọn đèn", key="tool",
                 ) or "🚦 Chọn đèn"
                 if tool == "🚦 Chọn đèn":
                     layout_opts = {"auto": "Tự động", "vertical": "Dọc", "horizontal": "Ngang", "lamp": "Chỉ bóng"}
                     st.segmented_control("Kiểu hộp đèn", list(layout_opts), format_func=layout_opts.get,
                                          default="auto", key="light_layout",
-                                         help="Khung tự ôm cả hộp đèn 3 bóng. Nếu đoán sai kiểu đèn (dọc/ngang), chọn lại "
-                                              "ở đây — khung tự tính lại, không cần bấm lại vào đèn.")
+                                         help="Khung tự ôm cả hộp đèn. Nếu đoán sai kiểu đèn (dọc/ngang), chọn lại ở đây.")
                     st.markdown(
-                        "Bấm vào **đèn tròn điều khiển làn xe cần giám sát**. Hệ thống tự ôm khung quanh đèn.  \n"
-                        f"<span style='color:{C_AMBER}'>Không chọn đèn mũi tên rẽ phải/trái</span> nếu làn đó có đèn riêng.",
+                        "Bấm vào **đèn tròn điều khiển làn xe cần giám sát**. Hệ thống tự ôm khung quanh đèn, "
+                        "mô hình A đọc màu trong khung đó.  \n"
+                        f"<span style='color:{C_AMBER}'>Không chọn đèn mũi tên rẽ</span> nếu làn đó có đèn riêng.",
                         unsafe_allow_html=True)
                 else:
-                    first_pt = st.session_state.line_first_pt
-                    st.markdown(
-                        ("Bấm **điểm thứ hai** (đầu còn lại của vạch dừng)." if first_pt else
-                         "Bấm **2 điểm** ở hai đầu vạch dừng.")
-                        + "  \nChỉ kéo vạch qua những làn chịu đèn đã chọn; bỏ làn rẽ có đèn mũi tên riêng.")
-                direction_lbl = st.radio("Hướng xe chạy (của làn chịu đèn đã chọn)", ["Từ trên xuống ↓", "Từ dưới lên ↑"],
-                                         horizontal=True, key="direction",
-                                         help="Thấy đầu xe ⇒ xe chạy về phía camera (thường là từ trên xuống). "
-                                              "Thấy đuôi xe, lưng người lái ⇒ xe chạy ra xa camera (từ dưới lên). "
-                                              "Mặt đèn quay về phía camera thường điều khiển các xe đang đi ra xa camera.")
-                direction = "down" if direction_lbl.startswith("Từ trên") else "up"
+                    st.markdown("Bấm **một điểm trên vạch dừng**. Vạch được coi là đường ngang (như notebook: `y_vach`). "
+                                "Dải xanh nhạt là vùng B quét tìm xe: từ 20% phía trên tới 15% phía dưới vạch.")
+                direction_lbl = st.radio("Hướng xe chạy qua vạch", [DIR_UP, DIR_DOWN], horizontal=False, key="direction",
+                                         help="Mô hình C và bước kết luận được học với xe đi từ dưới lên (ra xa camera, "
+                                              "XE_DI_LEN = True). Hướng ngược lại vẫn chạy được nhưng C chưa được học cho hướng đó.")
+                direction = "up" if direction_lbl == DIR_UP else "down"
                 guess = st.session_state.get("dir_guess") if input_type == "🎥 Video" else None
                 if guess and guess[0]:
                     g_lbl = "từ trên xuống ↓" if guess[0] == "down" else "từ dưới lên ↑"
-                    st.caption(f"Hệ thống đoán (optical flow): xe chủ yếu chạy **{g_lbl}** · độ tin cậy {guess[1] * 100:.0f}%")
+                    st.caption(f"Ước lượng bằng optical flow: xe chủ yếu chạy **{g_lbl}** · độ tin cậy {guess[1] * 100:.0f}%")
+                if direction == "down":
+                    st.caption("⚠ Dữ liệu huấn luyện chỉ có xe đi từ dưới lên, kết quả hướng này kém tin cậy hơn.")
                 light_options = {
-                    "auto": "Tự động nhận diện màu đèn",
+                    "auto": "Mô hình A đọc màu đèn",
                     "red": "Không thấy đèn trong hình · coi như luôn đỏ",
                     "green": "Coi như luôn xanh",
                 }
@@ -1558,12 +1211,7 @@ with tab_real:
                                           key="light_mode")
 
             with st.expander("Chỉnh chi tiết bằng thanh trượt"):
-                st.caption("Vạch dừng (% khung hình)")
-                a1, a2 = st.columns(2)
-                lx1 = a1.slider("Đầu 1 · ngang", 0, 100, key="lx1")
-                ly1 = a1.slider("Đầu 1 · dọc", 0, 100, key="ly1")
-                lx2 = a2.slider("Đầu 2 · ngang", 0, 100, key="lx2")
-                ly2 = a2.slider("Đầu 2 · dọc", 0, 100, key="ly2")
+                ly = st.slider("Vạch dừng · vị trí dọc (% chiều cao)", 0, 100, key="ly")
                 st.caption("Vùng đèn (% khung hình)")
                 b1, b2 = st.columns(2)
                 rx = b1.slider("Vị trí ngang", 0, 99, key="rx", on_change=_confirm_light)
@@ -1571,46 +1219,47 @@ with tab_real:
                 rw = b2.slider("Chiều rộng", 1, 50, key="rw", on_change=_confirm_light)
                 rh = b2.slider("Chiều cao", 1, 60, key="rh", on_change=_confirm_light)
 
-            with st.expander("Tinh chỉnh nâng cao"):
-                min_area_pct = st.slider("Diện tích xe nhỏ nhất (% khung hình)", 0.05, 5.0, 0.4, 0.05,
-                                         help="Tăng lên nếu lá cây, người đi bộ hoặc nhiễu bị nhận nhầm là xe.")
-                max_area_pct = st.slider("Diện tích xe lớn nhất (% khung hình)", 3, 60, 20,
-                                         help="Bỏ các vùng quá lớn: cả đoàn xe dính nhau, camera rung, chữ phủ lên video.")
-                car_area_pct = st.slider("Ngưỡng coi là ô tô (% khung hình)", 0.5, 15.0, 2.5, 0.5)
-                sensitivity = st.slider("Độ nhạy trừ nền (nhỏ = nhạy hơn)", 8, 80, 32)
-                frame_step = st.slider("Xử lý 1 trên mỗi N khung (lớn = nhanh hơn)", 1, 6, 2)
-                max_seconds = st.slider("Chỉ phân tích tối đa N giây đầu video", 5, 180, 60)
+            with st.expander("Lấy mẫu frame (tốc độ)"):
+                buoc_giay = st.select_slider("Khoảng cách giữa hai frame được xét (giây)",
+                                             [0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0], key="buoc_giay",
+                                             help="Như buoc_giay của notebook (mặc định 0,3 s): xe nên dịch khoảng một chiều "
+                                                  "cao xe trở xuống giữa hai frame để C ghép được.")
+                max_frames = st.slider("Số frame tối đa", 5, 150, 40,
+                                       help="B quét hàng nghìn cửa sổ bằng SVM-RBF: khoảng 3 đến 6 giây mỗi frame trên CPU.")
+                st.caption(f"Ước tính: {max_frames} frame × ~3–6 s ≈ {max_frames * 3 // 60}–{max(1, max_frames * 6 // 60)} phút. "
+                           f"Đoạn video được xét: {max_frames * buoc_giay:.0f} giây.")
 
-        cfg = dict(line=(lx1, ly1, lx2, ly2), direction=direction, light_roi=(rx, ry, rw, rh),
-                   light_mode=light_mode, min_area_pct=min_area_pct, max_area_pct=max_area_pct,
-                   car_area_pct=car_area_pct, sensitivity=sensitivity, frame_step=frame_step,
-                   max_seconds=max_seconds)
+        cfg = dict(y_vach=float(ly), direction=direction, light_roi=(rx, ry, rw, rh), light_mode=light_mode,
+                   nguong_xe=nguong_xe, nguong_C=nguong_C, lam_muot=lam_muot, buoc_giay=float(buoc_giay),
+                   max_frames=int(max_frames))
 
+        if (st.session_state.get("sample_confirmed") and source_key
+                and source_key.split("#")[0] == st.session_state.sample_confirmed):
+            st.session_state.light_confirmed_for = source_key
+            st.session_state.dir_applied_for = source_key
         light_ok = light_mode != "auto" or st.session_state.get("light_confirmed_for") == source_key
 
         with col_prev:
             Hp, Wp = preview.shape[:2]
-            line_prev = StopLine(cfg["line"], preview.shape, direction)
-            rect_prev = pct_rect_to_px(cfg["light_roi"], preview.shape)
-            x0, y0, x1, y1 = rect_prev
+            x0, y0, x1, y1 = pct_rect_to_px(cfg["light_roi"], preview.shape)
             light_roi_img = preview[y0:y1, x0:x1]
+            probs = {}
             if not light_ok:
                 prev_state = "UNKNOWN"
             elif light_mode == "auto":
-                prev_state, _ = classify_light(light_roi_img)
+                prev_state, probs = predict_light(preview, cfg["light_roi"])
             else:
                 prev_state = "RED" if light_mode == "red" else "GREEN"
+            fake = dict(den=prev_state, K=np.zeros((0, 4)), giu=[], canh_bao=[])
+            b_prev = st.session_state.get("b_preview")
+            if b_prev and b_prev[0] == (source_key, cfg["y_vach"], nguong_xe):
+                fake["K"] = b_prev[1]
             hint = "Xem truoc" if light_ok else "BAM VAO DEN GIAO THONG DE CHON DEN"
-            prev_img = draw_overlay(preview, line_prev, rect_prev, prev_state, {}, hint,
-                                    show_light=light_ok and light_mode == "auto")
-            p1, p2 = line_prev.pts()
-            mid = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
-            dy = 45 if direction == "down" else -45
-            cv2.arrowedLine(prev_img, (mid[0], mid[1] - dy), (mid[0], mid[1] + dy // 3), (248, 189, 56), 3, tipLength=0.35)
-            fp = st.session_state.line_first_pt
-            if tool != "🚦 Chọn đèn" and fp:
-                cv2.circle(prev_img, (int(fp[0] / 100 * Wp), int(fp[1] / 100 * Hp)), 7, (0, 215, 255), -1)
-                cv2.circle(prev_img, (int(fp[0] / 100 * Wp), int(fp[1] / 100 * Hp)), 11, (255, 255, 255), 2)
+            cfg_prev = dict(cfg, light_mode=light_mode if light_ok else "none")
+            prev_img = draw_result(preview, cfg_prev, fake, hint)
+            ly_px = int(cfg["y_vach"] / 100 * Hp)
+            dy = -45 if direction == "up" else 45
+            cv2.arrowedLine(prev_img, (Wp // 2, ly_px - dy), (Wp // 2, ly_px + dy // 3), (248, 189, 56), 3, tipLength=0.35)
 
             with st.container(border=True):
                 click = None
@@ -1639,23 +1288,15 @@ with tab_real:
                                                                 rh=min(max(nrh, 1), 60), light_mode="auto")
                             st.session_state.light_confirmed_for = source_key
                     else:
-                        pt = (round(cx / Wp * 100), round(cy / Hp * 100))
-                        if st.session_state.line_first_pt is None:
-                            st.session_state.line_first_pt = pt
-                        else:
-                            a_ = st.session_state.line_first_pt
-                            left, right = sorted([a_, pt])
-                            st.session_state.pending_cfg = dict(lx1=left[0], ly1=left[1], lx2=right[0], ly2=right[1])
-                            st.session_state.line_first_pt = None
+                        st.session_state.pending_cfg = dict(ly=int(round(cy / Hp * 100)))
                     st.rerun()
 
                 if st.session_state.get("light_miss") == source_key and tool == "🚦 Chọn đèn":
                     banner("<b>Chỗ vừa bấm không có đèn đang sáng</b>, nên chưa đặt khung đèn. Hãy bấm đúng vào bóng đèn "
-                           "đang sáng (đỏ, vàng hoặc xanh). Nếu muốn vẽ vạch dừng, chọn công cụ 📏 trước.", good=False)
+                           "đang sáng. Nếu muốn đặt vạch dừng, chọn công cụ 📏 trước.", good=False)
                 if not light_ok:
-                    banner("<b>Chưa chọn đèn.</b> Chọn công cụ 🚦 rồi bấm lên ảnh, vào đúng <b>đèn tròn</b> điều khiển "
-                           "làn xe cần giám sát (không phải đèn mũi tên rẽ). Nếu video không quay được đèn, chọn "
-                           "“coi như luôn đỏ” ở mục Trạng thái đèn.", good="warn")
+                    banner("<b>Chưa chọn đèn.</b> Chọn công cụ 🚦 rồi bấm vào đúng <b>đèn tròn</b> điều khiển làn xe cần "
+                           "giám sát. Nếu video không quay được đèn, chọn “coi như luôn đỏ” ở mục Trạng thái đèn.", good="warn")
                 cur_layout = st.session_state.get("light_layout") or "auto"
                 lc = st.session_state.get("last_lamp_click")
                 if (lc and lc[0] == source_key and light_ok and light_mode == "auto"
@@ -1667,7 +1308,7 @@ with tab_real:
                         st.session_state.pending_cfg = dict(rx=min(nrx, 99), ry=min(nry, 99), rw=min(max(nrw, 1), 50),
                                                             rh=min(max(nrh, 1), 60))
                         st.rerun()
-                z1, z2 = st.columns([1, 4], vertical_alignment="center")
+                z1, z2, z3 = st.columns([1, 3, 1.6], vertical_alignment="center")
                 if light_ok and light_mode == "auto" and light_roi_img.size:
                     zoom = cv2.resize(light_roi_img, (96, max(1, int(96 * light_roi_img.shape[0] / max(light_roi_img.shape[1], 1)))),
                                       interpolation=cv2.INTER_NEAREST)
@@ -1675,17 +1316,25 @@ with tab_real:
                 if light_ok and light_mode != "auto":
                     z2.markdown(f"Không dùng camera để đọc đèn &nbsp; {pill(prev_state)}", unsafe_allow_html=True)
                 elif light_ok:
-                    z2.markdown(f"Bên trong khung đèn &nbsp; {pill(prev_state)}<br>"
-                                f"<span style='color:{C_MUTED};font-size:.85rem'>Khung đầu tiên của video · "
-                                f"mũi tên xanh = hướng xe chạy</span>", unsafe_allow_html=True)
-                if light_ok and prev_state == "UNKNOWN" and light_mode == "auto":
-                    st.caption("Chưa thấy đèn sáng trong khung. Bấm lại vào đúng đèn, hoặc chọn “coi như luôn đỏ” "
-                               "nếu video không quay được đèn.")
+                    ptxt = " · ".join(f"{STATE_VN[{'red_light': 'RED', 'yellow_light': 'YELLOW', 'green_light': 'GREEN'}[k]]} "
+                                      f"{v:.2f}" for k, v in probs.items())
+                    z2.markdown(f"Mô hình A ({MODELS['A']['thuat_toan']}) &nbsp; {pill(prev_state)}<br>"
+                                f"<span style='color:{C_MUTED};font-size:.85rem'>Xác suất: {ptxt}</span>",
+                                unsafe_allow_html=True)
+                if z3.button("Thử B trên khung này", width="stretch",
+                             help="Chạy mô hình B (SVM-RBF) trên khung xem trước, mất vài giây."):
+                    with st.spinner("Mô hình B đang quét cửa sổ trượt..."):
+                        fr_ = HT.quet_frame(to640(preview), cfg["y_vach"] / 100)
+                        Kb_, _, _, _ = HT.khung_xe(fr_, nguong_xe)
+                    st.session_state.b_preview = ((source_key, cfg["y_vach"], nguong_xe), Kb_)
+                    st.rerun()
+                if b_prev and b_prev[0] == (source_key, cfg["y_vach"], nguong_xe):
+                    st.caption(f"Mô hình B tìm thấy {len(b_prev[1])} khung xe trong dải quét (khung xanh mảnh).")
 
         step(3, "Phân tích", "")
-        can_run = light_ok and not (input_type == "🖼️ Ảnh" and background is None)
-        if input_type == "🖼️ Ảnh" and background is None:
-            banner("Với 1–2 ảnh, hãy tải thêm ảnh nền đường trống, hoặc tải từ 3 ảnh liên tiếp trở lên.", good=False)
+        st.caption("Lưu ý: mô hình B học từ 4 camera của dataset (ảnh 640×640, cỡ xe theo dải). Trên camera khác, "
+                   "nhất là góc nhìn hay cỡ xe khác hẳn, B sẽ bỏ sót nhiều hơn (notebook mục G).")
+        can_run = light_ok and not (input_type == "🖼️ Ảnh" and not images)
         if not light_ok:
             st.caption("Nút phân tích sẽ mở khi bạn đã chọn đèn ở Bước 2.")
         run = st.button("🔍  Phân tích vi phạm", type="primary", disabled=not can_run, width="stretch")
@@ -1698,8 +1347,7 @@ with tab_real:
                                         end=sc_.get("end"), box=sc_.get("box"))
                 else:
                     frames = ((float(i), img) for i, img in enumerate(images))
-                    res = analyze_frames(frames, cfg, fps_eff=1.0, background=background,
-                                         progress=progress, total=len(images))
+                    res = analyze_frames_wrap(frames, cfg, len(images), progress)
             except Exception as exc:  # hiển thị lỗi gọn gàng thay vì vỡ trang
                 res = None
                 banner(f"Xử lý bị lỗi: {exc}", good=False)
@@ -1712,13 +1360,13 @@ with tab_real:
                 st.session_state.analysis = res
                 now = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
                 src_name = source_key.split(":")[1] if source_key else ""
+                lbl_ = (st.session_state.get("scene_info") or {}).get("label") if input_type == "🎥 Video" else ""
                 for v in res["violations"]:
                     st.session_state.violations_log.append({
-                        "Mã xe": v["MaXe"], "Loại xe": v["LoaiXe"], "Thời điểm": v["ThoiDiem"],
-                        "Đèn": v["TrangThaiDen"], "Vị trí": v["ViTri"],
-                        "Nguồn": src_name + (f" · {(st.session_state.get('scene_info') or {}).get('label')}"
-                                             if input_type == "🎥 Video" and (st.session_state.get('scene_info') or {}).get('label') else ""),
-                        "Phân tích lúc": now,
+                        "Mã xe (ID của C)": v["MaXe"], "Thời điểm": v["ThoiDiem"], "Đèn (A)": v["TrangThaiDen"],
+                        "P(đỏ) của A": None if v["XacSuatDo"] is None else round(v["XacSuatDo"], 3),
+                        "P(cùng xe) của C": round(v["XacSuatCungXe"], 3), "P(xe) của B": round(v["DiemXe"], 3),
+                        "Vị trí": v["ViTri"], "Nguồn": src_name + (f" · {lbl_}" if lbl_ else ""), "Phân tích lúc": now,
                     })
                 st.rerun()
 
@@ -1727,45 +1375,38 @@ with tab_real:
         if res is not None and res.get("source") == source_key:
             step(4, "Kết quả", "")
             n_v = len(res["violations"])
-            last = f"{res['duration']:.1f}s" if res["kind"] == "video" else str(res["n_frames"])
-            last_lbl = "Thời lượng đã xét" if res["kind"] == "video" else "Số ảnh đã xét"
             st.markdown(f"""
             <div class="kpis">
-                <div class="kpi"><div class="k">Phương tiện phát hiện</div><div class="v">{res['n_vehicles']}</div></div>
-                <div class="kpi {'bad' if n_v else 'good'}"><div class="k">Vượt đèn đỏ</div><div class="v">{n_v}</div></div>
-                <div class="kpi good"><div class="k">Qua vạch hợp lệ</div><div class="v">{res['crossed_ok']}</div></div>
-                <div class="kpi"><div class="k">{last_lbl}</div><div class="v">{last}</div></div>
+                <div class="kpi"><div class="k">Xe được C theo dõi (ID)</div><div class="v">{res['n_vehicles']}</div></div>
+                <div class="kpi {'bad' if n_v else 'good'}"><div class="k">Cảnh báo vượt đèn đỏ</div><div class="v">{n_v}</div></div>
+                <div class="kpi good"><div class="k">Qua vạch khi không đỏ</div><div class="v">{res['crossed_ok']}</div></div>
+                <div class="kpi"><div class="k">Frame đã xét</div><div class="v">{res['n_frames']}</div></div>
             </div>""", unsafe_allow_html=True)
-            if n_v:
-                banner(f"Phát hiện {n_v} phương tiện vượt vạch dừng khi đèn đỏ.", good=False)
+            if res["kind"] == "image" and res["n_frames"] == 1:
+                banner("Chỉ có 1 ảnh nên mới chạy được A và B. Cần ít nhất 2 ảnh liên tiếp để C ghép xe và biết xe có "
+                       "đi qua vạch hay không.", good="warn")
+            elif n_v:
+                banner(f"Phát hiện {n_v} phương tiện đi qua vạch dừng khi mô hình A báo đèn đỏ.", good=False)
             else:
-                banner("Không có phương tiện nào vượt vạch dừng khi đèn đỏ.", good=True)
+                banner("Không có phương tiện nào được C ghép đi qua vạch dừng khi đèn đỏ.", good=True)
+            st.caption(f"Thời gian chạy mô hình: {res['t_model']:.0f} s cho {res['n_frames']} frame "
+                       f"({res['t_model'] / max(res['n_frames'], 1):.1f} s/frame, B quét {res['n_windows']:,} cửa sổ mỗi frame).")
 
-            # Cảnh báo khi kết quả có thể sai do cấu hình
             seen_states = {s for _, s in res["timeline"]}
             if res.get("light_mode") == "auto" and res["timeline"] and "RED" not in seen_states:
                 seen_txt = ", ".join(STATE_VN[s].lower() for s in seen_states)
-                banner(f"<b>Suốt đoạn đã xét, đèn chưa lần nào được nhận là ĐỎ</b> (chỉ thấy: {seen_txt}). "
-                       "Nếu thực tế đèn đỏ, có thể khung đèn đang đặt sai chỗ, ví dụ trúng đèn mũi tên rẽ phải. "
-                       "Hãy bấm lại vào đúng đèn tròn ở Bước 2 rồi phân tích lại.", good="warn")
-            n_dn, n_up = res.get("moving_down", 0), res.get("moving_up", 0)
-            chosen_dir = res.get("direction", "down")
-            n_same, n_opp = (n_dn, n_up) if chosen_dir == "down" else (n_up, n_dn)
-            if res["kind"] == "video" and n_opp >= 3 and n_opp > 1.5 * n_same:
-                other = "Từ dưới lên ↑" if chosen_dir == "down" else "Từ trên xuống ↓"
-                banner(f"<b>Có thể bạn chọn ngược hướng xe chạy.</b> Trong vùng vạch dừng, {n_opp} xe đi theo hướng "
-                       f"<b>{other}</b>, chỉ {n_same} xe đi theo hướng đã chọn. Mẹo: nếu thấy đuôi xe / lưng người lái "
-                       "thì xe đang đi ra xa camera (từ dưới lên).", good="warn")
-            if res["kind"] == "video" and res["n_frames"] and res.get("skipped", 0) / res["n_frames"] > 0.15:
-                banner(f"{res['skipped']} / {res['n_frames']} khung hình bị bỏ qua vì gần như cả khung đều chuyển động. "
-                       "Video có thể bị rung, bị quay lại từ màn hình điện thoại, hoặc có chữ/hiệu ứng chạy đè lên. "
-                       "Kết quả sẽ chính xác hơn với video gốc từ camera đặt cố định.", good="warn")
+                banner(f"<b>Suốt đoạn đã xét, mô hình A chưa lần nào báo ĐỎ</b> (chỉ thấy: {seen_txt}). "
+                       "Nếu thực tế đèn đỏ, có thể khung đèn đặt sai chỗ. Hãy bấm lại vào đúng đèn tròn ở Bước 2.", good="warn")
+            if res["n_boxes"] == 0 and res["n_frames"]:
+                banner("<b>Mô hình B không tìm thấy xe nào trong dải quét.</b> Kiểm tra vạch dừng đã đặt đúng chưa "
+                       "(B chỉ quét quanh vạch), hoặc giảm ngưỡng B ở thanh bên.", good="warn")
 
             col_main, col_list = st.columns([1.75, 1], gap="large")
             with col_main:
                 with st.container(border=True):
                     if res["kind"] == "video":
-                        st.markdown("**Video kết quả** · khung xanh = bình thường, khung đỏ = vi phạm")
+                        st.markdown("**Video kết quả** · khung mảnh = B tìm xe, khung đậm = C ghép (có ID), "
+                                    "khung đỏ = vượt đèn đỏ, vệt vàng = quỹ đạo")
                         if res["video_browser_ok"]:
                             st.video(res["video_bytes"], format="video/mp4")
                         else:
@@ -1773,7 +1414,7 @@ with tab_real:
                         st.download_button("⬇  Tải video kết quả (.mp4)", res["video_bytes"],
                                            file_name="ket_qua_phan_tich.mp4", mime="video/mp4", width="stretch")
                     else:
-                        st.markdown("**Ảnh kết quả** · khung xanh = bình thường, khung đỏ = vi phạm")
+                        st.markdown("**Ảnh kết quả** · khung mảnh = B tìm xe, khung đậm = C ghép, khung đỏ = vượt đèn đỏ")
                         cols = st.columns(min(2, len(res["annotated"])))
                         for i, img in enumerate(res["annotated"]):
                             cols[i % len(cols)].image(img, channels="BGR", caption=f"Ảnh {i + 1}", width="stretch")
@@ -1789,14 +1430,16 @@ with tab_real:
                                         f'<span class="tm">⏱ {v["ThoiDiem"]}</span></div>', unsafe_allow_html=True)
                             ci, cm = st.columns([1, 1.3])
                             ci.image(v["crop"], width="stretch")
-                            cm.markdown(f'<div class="vmeta"><span>Loại xe</span><br>{v["LoaiXe"]}<br>'
-                                        f'<span>Đèn</span><br>{pill("RED")}</div>', unsafe_allow_html=True)
+                            pdo = "" if v["XacSuatDo"] is None else f" · P = {v['XacSuatDo']:.2f}"
+                            cm.markdown(f'<div class="vmeta"><span>Đèn (A)</span><br>{pill("RED")}{pdo}<br>'
+                                        f'<span>Cùng một xe (C)</span><br>P = {v["XacSuatCungXe"]:.2f}<br>'
+                                        f'<span>Là xe (B)</span><br>P = {v["DiemXe"]:.2f}</div>', unsafe_allow_html=True)
                             st.download_button("⬇  Ảnh bằng chứng", v["snapshot"], file_name=f"vi_pham_{v['MaXe']}.jpg",
                                                mime="image/jpeg", key=f"dl_{k}_{v['MaXe']}", width="stretch")
 
-            if res["kind"] == "video" and res["timeline"]:
+            if res["timeline"] and len(res["timeline"]) > 1:
                 with st.container(border=True):
-                    st.markdown("**Trạng thái đèn theo thời gian** · Mô hình A, vạch chấm = thời điểm vi phạm")
+                    st.markdown("**Trạng thái đèn theo thời gian** · Mô hình A (sau bỏ phiếu), vạch chấm = thời điểm cảnh báo")
                     st.plotly_chart(light_timeline_fig(res["timeline"], res["violations"]), width="stretch",
                                     config={"displayModeBar": False})
                     samples = res.get("light_samples") or {}
@@ -1815,73 +1458,100 @@ with tab_real:
                 for k, v in enumerate(res["violations"]):
                     gcols[k % 3].image(v["snapshot"], caption=f"{v['MaXe']} · {v['ThoiDiem']}", width="stretch")
 
-            st.caption("Kết quả chưa đúng? Chỉnh lại vạch dừng, vùng đèn hoặc mục “Tinh chỉnh nâng cao” rồi bấm Phân tích lại.")
+            st.caption("Kết quả chưa đúng? Chỉnh lại vạch dừng, vùng đèn, khoảng cách giữa hai frame hoặc ngưỡng ở thanh bên "
+                       "rồi bấm Phân tích lại.")
 
 # ==========================================
-# TAB 2: MÔ PHỎNG
-# ==========================================
-with tab_sim:
-    f1_img, l_state, _ = generate_traffic_scene(scenario, frame_idx=1, stop_y=stop_line_y)
-    f2_img, l_state, sim_violations = generate_traffic_scene(scenario, frame_idx=2, stop_y=stop_line_y)
-    st.markdown(f"<div style='margin:14px 0 10px'>Kết quả Mô hình A &nbsp; {pill(l_state)}</div>", unsafe_allow_html=True)
-    s1, s2 = st.columns(2, gap="large")
-    with s1:
-        with st.container(border=True):
-            st.markdown("**Khung hình t** · Mô hình B định vị xe")
-            st.image(f1_img, channels="BGR", width="stretch")
-    with s2:
-        with st.container(border=True):
-            st.markdown("**Khung hình t+1** · Mô hình C ghép cặp & kiểm tra vạch")
-            st.image(f2_img, channels="BGR", width="stretch")
-    if sim_violations:
-        for viol in sim_violations:
-            banner(f"{viol['MaXe']} ({viol['LoaiXe']}) cắt qua vạch dừng khi đèn đỏ.", good=False)
-    else:
-        banner("Tất cả phương tiện chấp hành đúng (dừng trước vạch hoặc đèn xanh).", good=True)
-    st.caption("Đây là cảnh dựng sẵn để minh hoạ quy trình. Để kiểm tra dữ liệu thật, dùng tab “Phân tích ảnh / video”.")
-
-# ==========================================
-# TAB 3: HIỆU NĂNG MÔ HÌNH
+# TAB 2: HIỆU NĂNG MÔ HÌNH (số liệu thật từ notebook)
 # ==========================================
 with tab_bench:
-    from plotly.subplots import make_subplots
-    groups = [("Model_A", "A · Nhận diện đèn", sel_model_a), ("Model_B", "B · Phát hiện xe", sel_model_b),
-              ("Model_C", "C · Ghép cặp xe", sel_model_c)]
     st.write("")
-    fig_b = make_subplots(rows=1, cols=3, subplot_titles=[g[1] for g in groups], shared_yaxes=True,
-                          horizontal_spacing=0.04)
-    for i, (key, _, sel) in enumerate(groups, start=1):
-        names = list(MODEL_PERFORMANCE[key])
-        accs = [MODEL_PERFORMANCE[key][n]["accuracy"] for n in names]
-        fig_b.add_trace(go.Bar(
-            x=[n.replace(" ", "<br>", 1) for n in names], y=accs, text=[f"{a}%" for a in accs], textposition="outside",
-            marker=dict(color=[C_ACCENT if n == sel else "#2A3A5C" for n in names]),
-            hovertemplate="%{x}: %{y}%<extra></extra>", showlegend=False,
-        ), row=1, col=i)
-    fig_b.update_yaxes(range=[80, 101.5], title_text="Accuracy (%)", row=1, col=1)
-    fig_b.update_xaxes(tickangle=0, tickfont=dict(size=11))
-    style_fig(fig_b, height=400)
-    fig_b.update_layout(margin=dict(l=8, r=8, t=56, b=8))
-    fig_b.update_annotations(font=dict(size=13, color=C_MUTED))
-    with st.container(border=True):
-        st.markdown("**Độ chính xác các thuật toán** · cột sáng màu = thuật toán đang chọn ở thanh bên")
-        st.plotly_chart(fig_b, width="stretch", config={"displayModeBar": False})
+    if not KQ:
+        st.info("Không tìm thấy **mo_hinh/ket_qua_tong_hop.json** (notebook lưu cùng file joblib). "
+                "Chép file này vào thư mục mo_hinh để xem số liệu đánh giá.")
+    else:
+        st.caption("Mọi con số dưới đây đọc từ ket_qua_tong_hop.json do notebook ghi ra. Mô hình được chọn trên tập val "
+                   "(A, B) hoặc theo AUC ngoài fold trên train (C); test chỉ chấm một lần. Lớp đa số là mốc đối chứng, "
+                   "MLP chỉ để tham khảo (DUNG_MLP = False).")
 
-    with st.container(border=True):
-        st.markdown("**Bộ mô hình đang chọn**")
-        st.dataframe(pd.DataFrame([
-            {"Mô hình": g[1], "Thuật toán": g[2], "Accuracy": p["accuracy"], "F1": p["f1"],
-             "Độ trễ (ms)": float(p["latency"].split()[0]), "Mô tả": p["desc"]}
-            for g, p in zip(groups, (perf_a, perf_b, perf_c))
-        ]), hide_index=True, width="stretch", column_config={
-            "Accuracy": st.column_config.ProgressColumn("Accuracy", format="%.1f%%", min_value=0, max_value=100),
-            "F1": st.column_config.NumberColumn("F1", format="%.2f"),
-            "Độ trễ (ms)": st.column_config.NumberColumn("Độ trễ", format="%.1f ms"),
-            "Mô tả": st.column_config.TextColumn("Mô tả", width="large"),
-        })
+        def cand_chart(rows, name_key, val_key, chosen, title, ymin=0.0):
+            rows = [r for r in rows if r.get(val_key) is not None]
+            names = [r[name_key] for r in rows]
+            vals = [r[val_key] for r in rows]
+            colors = [C_ACCENT if n == chosen else ("#475569" if "đa số" in n or n.startswith("MLP") else "#2A3A5C")
+                      for n in names]
+            fig = go.Figure(go.Bar(x=[n.replace(" (", "<br>(", 1) for n in names], y=vals,
+                                   text=[f"{v:.3f}" for v in vals], textposition="outside", marker=dict(color=colors),
+                                   hovertemplate="%{x}: %{y:.4f}<extra></extra>"))
+            fig.update_yaxes(range=[ymin, 1.05])
+            fig.update_xaxes(tickfont=dict(size=11))
+            return style_fig(fig, height=330, title=title)
+
+        g1, g2, g3 = st.columns(3, gap="medium")
+        with g1:
+            with st.container(border=True):
+                st.plotly_chart(cand_chart(_kq("A/bang_val", []), "Mô hình", "F1 val (TB)", MODELS["A"]["thuat_toan"],
+                                           "A · macro F1 trên val"), width="stretch", config={"displayModeBar": False})
+        with g2:
+            with st.container(border=True):
+                st.plotly_chart(cand_chart(_kq("B/bang_val", []), "Mô hình", "F1 val (TB)", MODELS["B"]["thuat_toan"],
+                                           "B · F1 xe/nền trên val"), width="stretch", config={"displayModeBar": False})
+        with g3:
+            with st.container(border=True):
+                st.plotly_chart(cand_chart(_kq("C_mo_hinh_ghep_xe/bang_ngoai_fold", []), "Mô hình C",
+                                           "AUC cặp thật (ngoài fold)", _ten_C(), "C · AUC ngoài fold (train)", ymin=0.5),
+                                width="stretch", config={"displayModeBar": False})
+        st.caption("Cột sáng màu = mô hình được chọn và đang chạy trên web.")
+
+        with st.container(border=True):
+            st.markdown("**Kết quả test của các mô hình đang chạy**")
+            bt_ = _b_tim_test() or {}
+            st.dataframe(pd.DataFrame([
+                {"Khối": "A · màu đèn", "Mô hình": f"{MODELS['A']['thuat_toan']} ({MODELS['A']['cau_hinh']})",
+                 "Kết quả test": f"macro F1 {fmt(_kq('A/test_macro_f1'))} · accuracy {fmt(_kq('A/test_accuracy'))} · "
+                                 f"recall đèn đỏ {fmt(_kq('A/recall_den_do'))}", "Số mẫu test": _kq("A/so_mau/test")},
+                {"Khối": "B · xe / nền (vùng cắt sẵn)", "Mô hình": f"{MODELS['B']['thuat_toan']} ({MODELS['B']['cau_hinh']})",
+                 "Kết quả test": f"F1 {fmt(_kq('B/test_f1'))} · precision {fmt(_kq('B/test_precision'))} · "
+                                 f"recall {fmt(_kq('B/test_recall'))}", "Số mẫu test": _kq("B/so_mau/test")},
+                {"Khối": "B · tìm xe trên frame", "Mô hình": f"{HT.phien_ban_B}, ngưỡng {HT.nguong_xe:g}",
+                 "Kết quả test": f"F1 {fmt(bt_.get('F1'))} · recall {fmt(bt_.get('Recall'))} · precision {fmt(bt_.get('Precision'))} "
+                                 f"(IoU ≥ 0,3, ghép một-một)", "Số mẫu test": _kq("B_tim_xe/so_frame_test")},
+                {"Khối": "C · theo dõi phương tiện", "Mô hình": f"{_ten_C()}, ngưỡng {HT.nguong_C:g}",
+                 "Kết quả test": f"AUC cặp thật ngoài fold {fmt(_auc_C())}",
+                 "Số mẫu test": _kq("C_mo_hinh_ghep_xe/so_cap_ung_vien_train")},
+            ]), hide_index=True, width="stretch")
+            st.caption("Số mẫu: vùng đèn (A), vùng ảnh (B), frame (B tìm xe), cặp ứng viên train (C).")
+
+        sys_rows = _kq("C_he_thong_A_B_C/ket_qua", []) or []
+        if sys_rows:
+            with st.container(border=True):
+                st.markdown("**Cả hệ thống A + B + C** · phát hiện xe vượt vạch và cảnh báo vượt đèn đỏ theo nhãn dataset")
+                df_sys = pd.DataFrame(sys_rows)
+                cols_ = [c for c in ["Hệ thống", "Tập", "Số cặp frame", "Lần đi vào giao lộ (nhãn)", "Vượt vạch: đúng",
+                                     "Vượt vạch: nhầm", "Vượt vạch: sót", "F1 vượt vạch", "Vượt đèn đỏ (nhãn)",
+                                     "Cảnh báo đúng", "Cảnh báo nhầm", "Bỏ sót vượt đỏ"] if c in df_sys]
+                st.dataframe(df_sys[cols_], hide_index=True, width="stretch",
+                             column_config={"F1 vượt vạch": st.column_config.NumberColumn(format="%.3f")})
+                st.caption("Val và test chỉ có 1 lần vượt đèn đỏ có nhãn nên số liệu cảnh báo rất ít mẫu; "
+                           "F1 vượt vạch là chỉ số chính để so sánh có và không có mô hình C.")
+
+        speed = _kq("toc_do/bang", []) or []
+        if speed:
+            with st.container(border=True):
+                st.markdown("**Tốc độ đo trong notebook** (CPU 2 nhân, mỗi frame)")
+                df_sp = pd.DataFrame(speed).rename(columns={"index": "Bước"})
+                fig_sp = px.bar(df_sp[df_sp["Bước"] != "Toàn pipeline / frame"], x="TB (ms)", y="Bước", orientation="h",
+                                color_discrete_sequence=["#A78BFA"], text="TB (ms)")
+                fig_sp.update_traces(texttemplate="%{x:.0f} ms", textposition="outside")
+                fig_sp.update_yaxes(autorange="reversed", title="")
+                st.plotly_chart(style_fig(fig_sp, height=280), width="stretch", config={"displayModeBar": False})
+                tot = df_sp[df_sp["Bước"] == "Toàn pipeline / frame"]
+                if len(tot):
+                    st.caption(f"Toàn pipeline ≈ {tot['TB (ms)'].iloc[0] / 1000:.1f} giây / frame "
+                               f"({_kq('toc_do/fps', 0):.2f} FPS). Phần lớn thời gian là SVM-RBF của B chấm hàng nghìn cửa sổ.")
 
 # ==========================================
-# TAB 4: ĐẶC TRƯNG HSV & HOG
+# TAB 3: ĐẶC TRƯNG CỦA MÔ HÌNH A VÀ B
 # ==========================================
 with tab_feat:
     res = st.session_state.analysis
@@ -1891,49 +1561,66 @@ with tab_feat:
     if res is None:
         st.caption("Đang hiển thị dữ liệu minh hoạ. Hãy phân tích một video ở tab đầu để xem đặc trưng lấy từ dữ liệu thật.")
     else:
-        st.caption("Đặc trưng được trích từ dữ liệu bạn vừa phân tích.")
+        st.caption("Đặc trưng được trích từ dữ liệu bạn vừa phân tích, đúng như mô hình nhìn thấy.")
 
     col_hsv, col_hog = st.columns(2, gap="large")
     with col_hsv:
         with st.container(border=True):
-            st.markdown("**Mô hình A · Vector màu HSV của vùng đèn (44 chiều)**")
+            st.markdown("**Mô hình A · 44 đặc trưng màu của vùng đèn**")
             if light_sample is None:
-                light_sample = np.full((90, 60, 3), 20, dtype=np.uint8)
-                cv2.circle(light_sample, (30, 22), 12, (0, 0, 235), -1)
+                light_sample = np.full((90, 40, 3), 20, dtype=np.uint8)
+                cv2.circle(light_sample, (20, 18), 11, (0, 0, 235), -1)
+                cv2.circle(light_sample, (20, 45), 11, (0, 40, 50), -1)
+                cv2.circle(light_sample, (20, 72), 11, (0, 50, 0), -1)
+            feat = dac_trung_den_anh(light_sample, (0.0, 0.0, 1.0, 1.0))
+            lop, xs = HT.doan_den(light_sample, (0.0, 0.0, 1.0, 1.0))
+            st_ = {"red_light": "RED", "yellow_light": "YELLOW", "green_light": "GREEN"}.get(lop, "UNKNOWN")
             hs1, hs2 = st.columns([1, 3])
             hs1.image(light_sample, channels="BGR", caption="Vùng đèn", width="stretch")
-            state_s, scores = classify_light(light_sample)
-            hs2.markdown(f"Kết luận &nbsp; {pill(state_s)}", unsafe_allow_html=True)
-            hs2.caption(" · ".join(f"{STATE_VN[k]}: {v * 100:.1f}% điểm ảnh" for k, v in scores.items()))
-            feat = hsv_feature(light_sample)
-            fig_hsv = px.bar(x=list(range(44)), y=feat, color=["Hue"] * 18 + ["Saturation"] * 16 + ["Value"] * 10,
-                             labels={"x": "Bin", "y": "Tỉ lệ điểm ảnh", "color": ""},
-                             color_discrete_map={"Hue": C_RED, "Saturation": C_AMBER, "Value": C_ACCENT})
-            fig_hsv.update_layout(legend=dict(orientation="h", y=1.12, x=0))
-            st.plotly_chart(style_fig(fig_hsv, height=300), width="stretch", config={"displayModeBar": False})
+            hs2.markdown(f"{MODELS['A']['thuat_toan']} kết luận &nbsp; {pill(st_)}", unsafe_allow_html=True)
+            hs2.caption(" · ".join(f"P({STATE_VN[{'red_light': 'RED', 'yellow_light': 'YELLOW', 'green_light': 'GREEN'}[k]].lower()}) "
+                                   f"= {v:.2f}" for k, v in xs.items()))
+            hs2.caption("Vùng đèn được nới 10% mỗi phía, thu về 32×32 rồi tính đặc trưng (giống bước tiền xử lý).")
+            fig_hsv = px.bar(x=list(range(44)), y=feat, color=TEN_NHOM_DEN,
+                             labels={"x": "Chỉ số đặc trưng", "y": "Giá trị (trước chuẩn hóa)", "color": ""},
+                             color_discrete_map={"H": C_RED, "S": C_AMBER, "V": C_ACCENT, "Tỉ lệ sáng": C_GREEN,
+                                                 "Thống kê": "#A78BFA", "Hình dạng": "#F472B6"})
+            fig_hsv.update_layout(legend=dict(orientation="h", y=1.15, x=0))
+            st.plotly_chart(style_fig(fig_hsv, height=320), width="stretch", config={"displayModeBar": False})
+            st.caption("18 bin Hue + 8 bin Saturation + 8 bin Value + tỉ lệ điểm sáng đỏ/vàng/xanh + "
+                       "trung bình và độ lệch H, S, V + tỉ lệ cao/rộng của khung.")
 
     with col_hog:
         with st.container(border=True):
-            st.markdown("**Mô hình B · Đặc trưng HOG của phương tiện**")
+            st.markdown("**Mô hình B · HOG → PCA 150 của vùng ảnh**")
             if vehicle_sample is None or vehicle_sample.size == 0:
-                demo, _, _ = generate_traffic_scene("Kịch bản 1: Đèn Đỏ - Xe máy Vượt Vạch (Vi Phạm)", 1)
-                vehicle_sample = demo[195:300, 335:465]
-            veh_sq = cv2.resize(vehicle_sample, (128, 128))
-            gray = cv2.cvtColor(veh_sq, cv2.COLOR_BGR2GRAY)
-            hog_vec, hog_img = hog(gray, orientations=9, pixels_per_cell=(8, 8), cells_per_block=(2, 2), visualize=True)
-            hog_img = np.sqrt(hog_img / max(hog_img.max(), 1e-6))  # làm rõ các nét gradient yếu
-            hog_img = cv2.resize((hog_img * 255).astype(np.uint8), (256, 256), interpolation=cv2.INTER_NEAREST)
-            hog_img = cv2.applyColorMap(hog_img, cv2.COLORMAP_INFERNO)
+                vehicle_sample = np.full((90, 60, 3), 70, dtype=np.uint8)
+                cv2.rectangle(vehicle_sample, (12, 20), (48, 80), (200, 200, 210), -1)
+                cv2.rectangle(vehicle_sample, (16, 26), (44, 44), (60, 60, 70), -1)
+            veh = cv2.resize(vehicle_sample, (64, 64), interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(veh, cv2.COLOR_BGR2GRAY)
+            hog_vec = hog_lo(gray[None])[0]
+            _, hog_img = hog(gray, orientations=9, pixels_per_cell=(8, 8), cells_per_block=(2, 2),
+                             block_norm="L2-Hys", visualize=True)
+            hog_img = np.sqrt(hog_img / max(hog_img.max(), 1e-6))
+            hog_img = cv2.applyColorMap(cv2.resize((hog_img * 255).astype(np.uint8), (256, 256),
+                                                   interpolation=cv2.INTER_NEAREST), cv2.COLORMAP_INFERNO)
+            z = HT.hog_sang_pca(hog_vec[None])
+            p_xe = float(HT.diem_xe(z)[0])
             g1, g2 = st.columns(2)
-            g1.image(cv2.resize(veh_sq, (256, 256)), channels="BGR", caption="Phương tiện (chuẩn hoá 128×128)", width="stretch")
+            g1.image(cv2.resize(veh, (256, 256), interpolation=cv2.INTER_NEAREST), channels="BGR",
+                     caption="Vùng ảnh chuẩn hoá 64×64", width="stretch")
             g2.image(hog_img, channels="BGR", caption="Hướng gradient (HOG)", width="stretch")
-            fig_hog = px.bar(x=list(range(60)), y=hog_vec[:60], labels={"x": "Chỉ số đặc trưng", "y": "Giá trị"},
+            st.markdown(f"{MODELS['B']['thuat_toan']}: P(xe) = **{p_xe:.3f}** "
+                        f"({'≥' if p_xe >= nguong_xe else '<'} ngưỡng {nguong_xe:g})")
+            fig_hog = px.bar(x=list(range(z.shape[1])), y=z[0], labels={"x": "Thành phần PCA", "y": "Giá trị"},
                              color_discrete_sequence=["#A78BFA"])
             st.plotly_chart(style_fig(fig_hog, height=220), width="stretch", config={"displayModeBar": False})
-            st.caption(f"Vector HOG có {hog_vec.size:,} chiều (ảnh 128×128, 9 hướng, cell 8×8, block 2×2); biểu đồ hiển thị 60 giá trị đầu.")
+            st.caption(f"HOG {hog_vec.size:,} chiều (9 hướng, ô 8×8, khối 2×2, L2-Hys) → chuẩn hóa → PCA "
+                       f"{z.shape[1]} thành phần → SVM-RBF. 150 thành phần giữ khoảng 69,5% phương sai.")
 
 # ==========================================
-# TAB 5: NHẬT KÝ VI PHẠM
+# TAB 4: NHẬT KÝ VI PHẠM
 # ==========================================
 with tab_log:
     st.write("")
@@ -1954,5 +1641,5 @@ with tab_log:
         <p>Phân tích một video ở tab đầu tiên. Mỗi phương tiện vượt đèn đỏ sẽ được ghi vào đây và có thể tải về dạng CSV.</p></div>
         """, unsafe_allow_html=True)
 
-st.markdown('<div class="footer">Đồ án môn Học Máy Truyền Thống © 2026 · Nhóm 6 · Streamlit & OpenCV</div>',
+st.markdown('<div class="footer">Đồ án môn Học Máy Truyền Thống © 2026 · Nhóm 6 · Streamlit, OpenCV & scikit-learn</div>',
             unsafe_allow_html=True)

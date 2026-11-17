@@ -1,4 +1,4 @@
-"""Lõi suy luận của hệ thống cảnh báo vượt đèn đỏ – tái hiện đúng notebook "Máy học" (nhóm 6).
+"""Lõi suy luận của hệ thống cảnh báo vượt đèn đỏ – tái hiện đúng notebook "Máy học".
 
 Dùng file mô hình mà notebook lưu ở mục E: ``mo_hinh/he_thong_canh_bao.joblib``
     mo_hinh_A          k-NN (k=9, distance, manhattan) – màu đèn từ 44 đặc trưng HSV (đã chuẩn hóa bằng chuan_hoa_A)

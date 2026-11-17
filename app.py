@@ -23,6 +23,12 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(APP_DIR, "mo_hinh")
 
 
+def _khoa_ten(ten):
+    """Sắp tên file theo số tự nhiên: anh_2.jpg đứng trước anh_10.jpg."""
+    import re
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", ten)]
+
+
 def _tim(ten):
     """Tìm file trong mo_hinh/ trước, nếu không có thì tìm cạnh app.py (repo để file ở thư mục gốc)."""
     for d in (MODEL_DIR, APP_DIR):
@@ -41,7 +47,7 @@ NOTEBOOK_SAMPLE = _tim("video_mau_test.mp4")      # video ghép từ frame test 
 # CẤU HÌNH TRANG & GIAO DIỆN
 # ==========================================
 st.set_page_config(
-    page_title="Giám sát vượt đèn đỏ · Nhóm 6",
+    page_title="Cảnh báo vượt đèn đỏ",
     page_icon="🚦",
     layout="wide",
     initial_sidebar_state="auto",
@@ -974,7 +980,7 @@ with st.sidebar:
     st.markdown("""
     <div class="brand">
         <div class="tl-icon"><span class="r"></span><span class="y"></span><span class="g"></span></div>
-        <div><div class="t">Giám sát vượt đèn đỏ</div><div class="s">Đồ án Học Máy Truyền Thống · Nhóm 6</div></div>
+        <div><div class="t">Cảnh báo vượt đèn đỏ</div><div class="s">Đồ án Học Máy Truyền Thống</div></div>
     </div>""", unsafe_allow_html=True)
 
     st.markdown('<div class="sb-sec">Mô hình đang chạy (từ notebook)</div>', unsafe_allow_html=True)
@@ -989,12 +995,39 @@ with st.sidebar:
 
     st.markdown('<div class="sb-sec">Ngưỡng của hệ thống</div>', unsafe_allow_html=True)
     nguong_xe = st.slider("Ngưỡng B (xác suất là xe)", 0.5, 0.99, float(HT.nguong_xe), 0.01,
-                          help=f"Notebook chọn {HT.nguong_xe:g} trên tập val. Chỉ ảnh hưởng khung B hiển thị; "
-                               f"C luôn nhận mọi khung có điểm ≥ {HT.nguong_vao_C:g} như notebook.")
+                          help=f"Một vùng ảnh được coi là xe khi B chấm xác suất ≥ ngưỡng này. Cao hơn: ít khung nhầm "
+                               f"nhưng dễ sót xe; thấp hơn: ngược lại. Mặc định {HT.nguong_xe:g} (chọn trên 60 khung val). "
+                               f"Ngưỡng này chỉ đổi khung xe được vẽ; C1 luôn xét mọi khung có điểm ≥ {HT.nguong_vao_C:g}.")
     nguong_C = st.slider("Ngưỡng C (xác suất cùng một xe)", 0.1, 0.9, float(HT.nguong_C), 0.05,
-                         help=f"Notebook chọn {HT.nguong_C:g} theo F1 vượt vạch ngoài fold trên train.")
-    lam_muot = st.slider("Bỏ phiếu màu đèn trên N frame (D1)", 1, 5, 3,
-                         help="Màu đèn = đa số của N frame gần nhất (LAM_MUOT_A = 3 trong notebook).")
+                         help=f"Hai khung ở hai ảnh liên tiếp chỉ được ghép là cùng một xe khi C1 chấm xác suất ≥ ngưỡng này. "
+                              f"Cao hơn: ghép chắc chắn, ít cảnh báo nhầm nhưng dễ sót; thấp hơn: ngược lại. "
+                              f"Mặc định {HT.nguong_C:g} (chọn theo F1 vượt vạch ngoài fold trên train).")
+    lam_muot = st.slider("Làm mượt màu đèn: số frame bỏ phiếu", 1, 5, 3,
+                         help="Màu đèn ở mỗi frame là màu xuất hiện nhiều nhất trong N frame gần nhất, để một frame đoán "
+                              "sai không làm đổi màu. N = 1: không làm mượt. N lớn: ổn định hơn nhưng đổi màu chậm hơn "
+                              "khi đèn chuyển. Mặc định 3 như notebook.")
+    with st.expander("Giải thích các ngưỡng"):
+        st.markdown(
+            f"""
+**Ngưỡng B = {HT.nguong_xe:g} (xác suất là xe).** Mô hình B (SVM-RBF) chấm mỗi cửa sổ quét một xác suất "là xe".
+Chỉ cửa sổ có xác suất từ ngưỡng này trở lên mới thành khung xe trên màn hình.
+- Tăng ngưỡng: ít khung nhầm (vẽ cả cây, vạch sơn…), nhưng dễ bỏ sót xe.
+- Giảm ngưỡng: bắt được nhiều xe hơn, nhưng nhiều khung nhầm hơn.
+- {HT.nguong_xe:g} là ngưỡng cho F1 tìm xe cao nhất trên 60 khung val (test: F1 0,447; Precision 0,538; Recall 0,383).
+- Mô hình C1 vẫn nhận mọi khung có điểm ≥ {HT.nguong_vao_C:g} để ghép, nên ngưỡng B chủ yếu đổi phần hiển thị.
+
+**Ngưỡng C = {HT.nguong_C:g} (xác suất cùng một xe).** Với mỗi cặp khung ở hai ảnh liên tiếp, mô hình C1 (k-NN) chấm xác
+suất hai khung là cùng một xe. Cặp có xác suất ≥ ngưỡng mới được ghép; thuật toán Hungary đảm bảo mỗi xe chỉ ghép với một xe.
+- Tăng ngưỡng: chỉ ghép cặp rất chắc chắn, ít cảnh báo nhầm, nhưng bỏ sót nhiều lần vượt vạch hơn.
+- Giảm ngưỡng: ghép được nhiều hơn, nhưng dễ ghép nhầm hai xe khác nhau và báo nhầm.
+- {HT.nguong_C:g} là ngưỡng cho F1 vượt vạch cao nhất khi dự đoán ngoài fold trên train (không dùng test để chọn).
+
+**Làm mượt màu đèn = 3 frame.** Mô hình A đoán màu đèn ở từng frame. Màu dùng để kết luận là màu xuất hiện nhiều nhất
+trong 3 frame gần nhất, để một frame đoán sai (đèn lóa, bị che) không biến đèn xanh thành đỏ hay ngược lại.
+
+**Khi nào cảnh báo:** cùng một xe (C1 ghép) có đáy khung ở ảnh trước nằm trước vạch dừng, ở ảnh sau đã qua vạch, và màu
+đèn (sau khi làm mượt) là đỏ. Mỗi xe chỉ bị cảnh báo một lần.
+""")
     if (nguong_xe, nguong_C, lam_muot) != (HT.nguong_xe, HT.nguong_C, 3):
         st.caption("⚠ Đang khác cấu hình notebook: số liệu đánh giá ở tab Hiệu năng không còn áp dụng.")
 
@@ -1116,12 +1149,16 @@ with tab_real:
                 if preview is None:
                     banner("Không đọc được khung hình của cảnh này.", good=False)
     else:
-        ups = st.file_uploader("Ảnh cần kiểm tra: 1 ảnh, hoặc nhiều ảnh liên tiếp cùng góc camera (sắp theo tên file)",
+        ups = st.file_uploader("Ảnh cần kiểm tra: 1 ảnh, hoặc nhiều ảnh liên tiếp cùng góc camera",
                                type=["jpg", "jpeg", "png", "bmp", "webp"], accept_multiple_files=True,
                                help="Từ 2 ảnh trở lên, mô hình C ghép xe giữa từng cặp ảnh liền nhau để biết xe có đi qua "
-                                    "vạch không (giống hàm chay_anh_thuc_te của notebook). 1 ảnh: chỉ chạy A và B.")
+                                    "vạch không (giống hàm chay_anh_thuc_te của notebook). 1 ảnh: chỉ chạy A và B. "
+                                    "Ảnh được xếp theo tên file, nên đặt tên theo thứ tự thời gian: 01.jpg, 02.jpg, 03.jpg… "
+                                    "hoặc anh_1.jpg, anh_2.jpg… (web so số theo giá trị, nên anh_2 đứng trước anh_10).")
+        st.caption("Thứ tự ảnh = thứ tự tên file. Đặt tên theo thời gian chụp, ví dụ 01.jpg, 02.jpg, 03.jpg "
+                   "(ảnh chụp sớm hơn đặt số nhỏ hơn). Mỗi cặp ảnh liền nhau nên cách nhau khoảng 0,3 giây.")
         if ups:
-            ups = sorted(ups, key=lambda f: f.name)
+            ups = sorted(ups, key=lambda f: _khoa_ten(f.name))
             decoded = [decode_upload_image(u) for u in ups]
             if any(d is None for d in decoded):
                 banner("Có ảnh không đọc được. Hãy dùng ảnh JPG hoặc PNG.", good=False)
@@ -1652,5 +1689,5 @@ with tab_log:
         <p>Phân tích một video ở tab đầu tiên. Mỗi phương tiện vượt đèn đỏ sẽ được ghi vào đây và có thể tải về dạng CSV.</p></div>
         """, unsafe_allow_html=True)
 
-st.markdown('<div class="footer">Đồ án môn Học Máy Truyền Thống © 2026 · Nhóm 6 · Streamlit, OpenCV & scikit-learn</div>',
+st.markdown('<div class="footer">Đồ án môn Học Máy Truyền Thống © 2026 · Streamlit, OpenCV & scikit-learn</div>',
             unsafe_allow_html=True)

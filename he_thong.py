@@ -421,6 +421,27 @@ class HeThongCanhBao:
         return giu
 
 
+def mau_khung(img, khung):
+    """Histogram H-S (18 × 8, chuẩn hóa tổng = 1) của phần giữa khung xe, để nhận lại cùng một xe khi C mất dấu."""
+    H, W = img.shape[:2]
+    x0, y0, x1, y1 = [int(round(v)) for v in khung]
+    w, h = x1 - x0, y1 - y0
+    x0, x1 = max(0, x0 + w // 6), min(W, x1 - w // 6)
+    y0, y1 = max(0, y0 + h // 6), min(H, y1 - h // 6)
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return None
+    hsv = cv2.cvtColor(np.ascontiguousarray(img[y0:y1, x0:x1]), cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [18, 8], [0, 180, 0, 256]).ravel()
+    return hist / max(hist.sum(), 1e-9)
+
+
+def do_giong_mau(a, b):
+    """Hệ số Bhattacharyya của hai histogram (1 = giống hệt, 0 = khác hẳn); 0 khi thiếu một bên."""
+    if a is None or b is None:
+        return 0.0
+    return float(np.sqrt(a * b).sum())
+
+
 class BoTheoDoi:
     """Chạy hệ thống trên chuỗi frame liên tiếp (video hoặc nhiều ảnh), giống chay_video của notebook:
     mỗi cặp frame liền nhau → C ghép xe → xe đi qua vạch + A báo đỏ ⇒ cảnh báo.
@@ -442,6 +463,7 @@ class BoTheoDoi:
         self.da_qua_vach = set()
         self.quy_dao = {}           # ID → danh sách (thời điểm, điểm đáy khung px 640)
         self.khung_cuoi = {}        # ID đã qua vạch → (thời điểm thấy lần cuối, khung px 640)
+        self.luc_qua_vach = {}      # ID đã qua vạch → (thời điểm qua vạch, khung lúc qua vạch, màu xe lúc qua vạch)
 
     def den(self, img640):
         if self.che_do_den == "red":
@@ -470,8 +492,10 @@ class BoTheoDoi:
                 if tid is None:
                     tid = self.next_id; self.next_id += 1
                     self.quy_dao[tid] = [(self.t_truoc, self._day(r["khung_a"]))]
+                mau_r = None
                 if r["vuot_len"] and tid not in self.da_qua_vach:
-                    cu = self._xe_da_qua_vach(r["khung_a"], t, khung_2=r["khung_b"])
+                    mau_r = mau_khung(img640, r["khung_b"])
+                    cu = self._xe_da_qua_vach(r["khung_a"], t, khung_2=r["khung_b"], mau=mau_r)
                     if cu is not None:
                         # C mất dấu rồi gán ID mới cho chính chiếc xe đã qua vạch (xe đứng đè lên vạch, khung rung
                         # qua lại): nối về ID cũ, không cảnh báo lần hai
@@ -483,9 +507,13 @@ class BoTheoDoi:
                 self.quy_dao.setdefault(tid, []).append((t, self._day(r["khung_b"])))
                 if tid in self.khung_cuoi:
                     self.khung_cuoi[tid] = (t, r["khung_b"])
+                if r["vuot_len"] and tid not in self.da_qua_vach and self._dung_yen(tid, r):
+                    # xe đứng đè lên vạch: đáy khung chỉ rung quanh vạch, không phải đi qua → không tính
+                    r["vuot_len"] = False
                 if r["vuot_len"] and tid not in self.da_qua_vach:
                     self.da_qua_vach.add(tid)                    # D3: mỗi xe (ID) chỉ xét một lần
                     self.khung_cuoi[tid] = (t, r["khung_b"])
+                    self.luc_qua_vach[tid] = (t, r["khung_b"], mau_r if mau_r is not None else mau_khung(img640, r["khung_b"]))
                     if trang_thai == "RED":
                         canh_moi.append(r)
                     else:
@@ -494,28 +522,54 @@ class BoTheoDoi:
         return dict(t=t, den=trang_thai, xac_suat_den=xs, K=K_hien, d=d_hien, so_ung_vien=len(K_vao),
                     giu=giu, canh_bao=canh_moi, vuot_hop_le=vuot_ok, so_cua_so=len(fr.K))
 
-    def _xe_da_qua_vach(self, khung, t, giay=15.0, khung_2=None):
-        """ID của xe đã qua vạch trong `giay` giây gần đây và đang ở gần như cùng chỗ với khung này.
+    def _xe_da_qua_vach(self, khung, t, giay=30.0, khung_2=None, mau=None):
+        """ID của xe đã qua vạch trong `giay` giây gần đây và chính là xe này (C mất dấu rồi gán ID mới).
 
-        Cùng chỗ = hai khung chồng nhau (IoU ≥ 0,3) hoặc điểm giữa đáy lệch ngang ≤ nửa chiều rộng và lệch dọc ≤ nửa
-        chiều cao khung cũ (khung của cùng một xe có thể to nhỏ khác nhau giữa cửa sổ trượt và vùng chuyển động).
+        So khung mới với khung lúc qua vạch và khung thấy lần cuối của mỗi ID đã qua vạch:
+        - cùng chỗ: IoU ≥ 0,3, hoặc điểm giữa đáy lệch ngang ≤ nửa chiều rộng và lệch dọc ≤ nửa chiều cao (lấy cỡ
+          khung lớn hơn, vì khung của cùng một xe từ cửa sổ trượt và từ vùng chuyển động có thể to nhỏ khác nhau);
+        - hoặc gần chỗ (lệch ngang ≤ 1 chiều rộng, lệch dọc ≤ 0,8 chiều cao) và cùng màu xe (độ giống histogram
+          H-S ≥ 0,6).
         """
         ds = [np.asarray(khung, float)] + ([np.asarray(khung_2, float)] if khung_2 is not None else [])
         tot, best = None, None
-        for tid, (t0, k0) in self.khung_cuoi.items():
-            if t - t0 > giay:
-                continue
-            k0 = np.asarray(k0, float)
-            w0, h0 = k0[2] - k0[0], k0[3] - k0[1]
-            for k in ds:
-                iou = float(iou_ma_tran(k0[None], k[None])[0, 0])
-                dx = abs((k[0] + k[2]) / 2 - (k0[0] + k0[2]) / 2)
-                dy = abs(k[3] - k0[3])
-                if iou >= 0.3 or (dx <= 0.5 * w0 and dy <= 0.5 * h0):
-                    diem = iou - dx / max(w0, 1)
-                    if best is None or diem > best:
-                        tot, best = tid, diem
+        for tid in set(self.khung_cuoi) | set(self.luc_qua_vach):
+            ung = []
+            if tid in self.khung_cuoi:
+                ung.append((self.khung_cuoi[tid][0], self.khung_cuoi[tid][1]))
+            mau0 = None
+            if tid in self.luc_qua_vach:
+                t1, k1, mau0 = self.luc_qua_vach[tid]
+                ung.append((t1, k1))
+            giong = do_giong_mau(mau, mau0)
+            for t0, k0 in ung:
+                if t - t0 > giay:
+                    continue
+                k0 = np.asarray(k0, float)
+                for k in ds:
+                    w = max(k0[2] - k0[0], k[2] - k[0], 1.0); h = max(k0[3] - k0[1], k[3] - k[1], 1.0)
+                    iou = float(iou_ma_tran(k0[None], k[None])[0, 0])
+                    dx = abs((k[0] + k[2]) / 2 - (k0[0] + k0[2]) / 2)
+                    dy = abs(k[3] - k0[3])
+                    cung_cho = iou >= 0.3 or (dx <= 0.5 * w and dy <= 0.5 * h)
+                    gan_cung_mau = dx <= 1.0 * w and dy <= 0.8 * h and giong >= 0.6
+                    if cung_cho or gan_cung_mau:
+                        diem = iou - dx / w + giong
+                        if best is None or diem > best:
+                            tot, best = tid, diem
         return tot
+
+    def _dung_yen(self, tid, r):
+        """Xe đứng đè lên vạch: đáy khung ở hai frame chỉ lệch nhau dưới 6% chiều cao khung và vết của ID này
+        (nếu có) chưa từng ở dưới vạch quá 15% chiều cao khung — tức là nó không thật sự đi từ dưới vạch lên."""
+        ka, kb = np.asarray(r["khung_a"], float), np.asarray(r["khung_b"], float)
+        h = max(ka[3] - ka[1], kb[3] - kb[1], 1.0)
+        ly = self.y_vach * 640 if self.y_vach <= 1 else self.y_vach
+        if abs(ka[3] - kb[3]) >= 0.06 * h:
+            return False
+        day = [p[1] for _, p in self.quy_dao.get(tid, [])] + [ka[3]]
+        di = (lambda y: y - ly) if self.xe_di_len else (lambda y: ly - y)
+        return max(di(y) for y in day) < 0.15 * h
 
     @staticmethod
     def _day(k):

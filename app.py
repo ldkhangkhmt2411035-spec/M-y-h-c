@@ -13,7 +13,22 @@ import plotly.graph_objects as go
 import streamlit as st
 from skimage.feature import hog
 
+import hashlib
+import importlib
+
+import he_thong as _lo_he_thong
+
+# Luôn nạp lại he_thong.py ở mỗi lần chạy, để khi repo cập nhật lõi mới thì web dùng ngay bản mới
+_lo_he_thong = importlib.reload(_lo_he_thong)
+with open(_lo_he_thong.__file__, "rb") as _f:
+    PHIEN_BAN_LOI = hashlib.md5(_f.read()).hexdigest()[:8]
 from he_thong import (BoTheoDoi, HeThongCanhBao, TEN_NHOM_DEN, dac_trung_den_anh, hog_lo)
+
+try:
+    from he_thong import anh_nen_trung_vi
+except ImportError:
+    def anh_nen_trung_vi(ds_anh):
+        return None
 
 try:  # he_thong.py bản mới có hàm này; nếu repo còn he_thong.py cũ thì web vẫn chạy (chỉ không vẽ khung bóng đèn)
     from he_thong import khung_bong_sang
@@ -627,7 +642,8 @@ def read_first_frame(video_path):
 # NẠP MÔ HÌNH ĐÃ HUẤN LUYỆN TỪ NOTEBOOK
 # ==========================================
 @st.cache_resource(show_spinner="Đang nạp mô hình A, B, C từ notebook...")
-def load_system(path, mtime):
+def load_system(path, mtime, phien_ban_loi):
+    # phien_ban_loi nằm trong khóa cache: he_thong.py đổi thì mô hình được nạp lại bằng lõi mới
     return HeThongCanhBao(path)
 
 
@@ -641,7 +657,7 @@ if not os.path.exists(MODEL_PATH):
     st.error("Không tìm thấy **mo_hinh/he_thong_canh_bao.joblib**. Chép file này (notebook lưu ở mục E, nằm trong "
              "`ket_qua_mo_hinh.zip`) vào thư mục `mo_hinh/` cạnh app.py rồi tải lại trang.")
     st.stop()
-HT = load_system(MODEL_PATH, os.path.getmtime(MODEL_PATH))
+HT = load_system(MODEL_PATH, os.path.getmtime(MODEL_PATH), PHIEN_BAN_LOI)
 KQ = load_results(RESULT_PATH, os.path.getmtime(RESULT_PATH)) if os.path.exists(RESULT_PATH) else {}
 
 
@@ -783,7 +799,7 @@ def analyze_sequence(frames, cfg, total, progress=None, writer=None):
                    light_box_rel(cfg["light_roi"]) if cfg["light_mode"] == "auto" else None,
                    che_do_den=cfg["light_mode"], xe_di_len=cfg["direction"] == "up",
                    nguong_xe=cfg["nguong_xe"], nguong_C=cfg["nguong_C"], lam_muot=cfg["lam_muot"],
-                   he_so_co=cfg.get("he_so_co", 1.0))
+                   he_so_co=cfg.get("he_so_co", 1.0), nen=cfg.get("nen"))
     res = dict(violations=[], timeline=[], annotated=[], n_frames=0, crossed_ok=0, light_samples={},
                light_sample=None, vehicle_sample=None, n_boxes=0, n_windows=0, t_model=0.0, p_light=[])
     viol_ids = set()
@@ -875,6 +891,15 @@ def analyze_video(video_path, cfg, progress, start=0.0, end=None, box=None):
     first = resize_frame(crop_rel(first, box))
     size = (first.shape[1], first.shape[0])
     want = set(wanted)
+    if cfg.get("tru_nen", True):
+        # ảnh nền của camera = trung vị 25 khung rải đều trên đoạn được xét (xe chạy qua bị loại)
+        mau = []
+        for fi in np.linspace(wanted[0], wanted[-1], num=min(25, max(3, len(wanted)))).astype(int):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+            ok_, f_ = cap.read()
+            if ok_:
+                mau.append(to640(resize_frame(crop_rel(f_, box), size)))
+        cfg = dict(cfg, nen=anh_nen_trung_vi(mau))
 
     def gen():
         cap.set(cv2.CAP_PROP_POS_FRAMES, wanted[0])
@@ -1014,6 +1039,8 @@ with st.sidebar:
     st.caption("Số xanh lá: macro F1 test (A), F1 xe/nền test (B), AUC ngoài fold (C). "
                "Chỉ các mô hình được chọn ở notebook mới được lưu vào file joblib, nên web chạy đúng bộ này.")
 
+    st.caption(f"Phiên bản lõi: {PHIEN_BAN_LOI} · đọc màu đèn: "
+               f"{'mô hình A + vị trí bóng sáng' if hasattr(HT, 'doan_den_chi_tiet') else 'chỉ mô hình A (lõi cũ)'}")
     st.markdown('<div class="sb-sec">Ngưỡng của hệ thống</div>', unsafe_allow_html=True)
     nguong_xe = st.slider("Ngưỡng B (xác suất là xe)", 0.5, 0.99, float(HT.nguong_xe), 0.01,
                           help=f"Một vùng ảnh được coi là xe khi B chấm xác suất ≥ ngưỡng này. Cao hơn: ít khung nhầm "
@@ -1290,6 +1317,11 @@ with tab_real:
                 help="Mô hình B quét cửa sổ có cỡ cố định theo camera trong dataset. Nếu xe trong video của bạn to hơn "
                      "(camera gần, zoom) thì tăng lên, nhỏ hơn thì giảm. Bấm “Thử B trên khung này” để xem khung xe có ôm "
                      "vừa xe không. 1,0 = đúng như notebook.")
+            tru_nen = st.checkbox(
+                "Tìm thêm xe ở vùng có chuyển động (camera đứng yên)", value=True, key="tru_nen",
+                help="Web lấy ảnh nền của camera (trung vị nhiều khung), tìm các vùng khác nền quanh vạch dừng, rồi cho "
+                     "mô hình B chấm từng vùng là xe hay nền. Giúp B không bỏ sót xe to hoặc góc camera khác dataset. "
+                     "Đây là bổ sung của web; số liệu trong báo cáo đo bằng notebook không có bước này.")
             with st.expander("Chỉnh chi tiết bằng thanh trượt"):
                 ly = st.slider("Vạch dừng · vị trí dọc (% chiều cao)", 0, 100, key="ly")
                 st.caption("Vùng đèn (% khung hình)")
@@ -1311,7 +1343,7 @@ with tab_real:
 
         cfg = dict(y_vach=float(ly), direction=direction, light_roi=(rx, ry, rw, rh), light_mode=light_mode,
                    nguong_xe=nguong_xe, nguong_C=nguong_C, lam_muot=lam_muot, buoc_giay=float(buoc_giay),
-                   he_so_co=float(he_so_co),
+                   he_so_co=float(he_so_co), tru_nen=bool(tru_nen),
                    max_frames=int(max_frames))
 
         if (st.session_state.get("sample_confirmed") and source_key
@@ -1447,6 +1479,8 @@ with tab_real:
                                         end=sc_.get("end"), box=sc_.get("box"))
                 else:
                     frames = ((float(i), img) for i, img in enumerate(images))
+                    if cfg.get("tru_nen", True) and len(images) >= 3:
+                        cfg = dict(cfg, nen=anh_nen_trung_vi([to640(im) for im in images]))
                     res = analyze_frames_wrap(frames, cfg, len(images), progress)
             except Exception as exc:  # hiển thị lỗi gọn gàng thay vì vỡ trang
                 res = None

@@ -189,6 +189,42 @@ def mau_theo_vi_tri(img, khung):
     return lop
 
 
+def vung_chuyen_dong(img, nen, y_vach, tren=0.35, duoi=0.25, dien_tich_min=350):
+    """Khung các vùng chuyển động (so với ảnh nền trung vị của camera đứng yên), đáy nằm quanh vạch dừng.
+
+    Chỉ là bước đề xuất vùng: mỗi vùng sau đó vẫn được mô hình B (SVM-RBF) chấm "xe / nền".
+    """
+    if nen is None:
+        return np.zeros((0, 4))
+    a = cv2.GaussianBlur(img, (5, 5), 0).astype(np.int16)
+    b = cv2.GaussianBlur(nen, (5, 5), 0).astype(np.int16)
+    diff = np.abs(a - b).max(axis=2).astype(np.uint8)
+    m = (diff >= 35).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    n, _, tk, _ = cv2.connectedComponentsWithStats(m, 8)
+    H, W = img.shape[:2]
+    lo, hi = (y_vach - tren) * H, (y_vach + duoi) * H
+    K = []
+    for i in range(1, n):
+        x, y, w, h, area = tk[i]
+        if area < dien_tich_min or w < 12 or h < 12 or w > 0.6 * W or h > 0.6 * H:
+            continue
+        if not (lo <= y + h <= hi):
+            continue
+        g = 0.06
+        K.append((max(0, x - g * w), max(0, y - g * h), min(W, x + w * (1 + g)), min(H, y + h * (1 + g))))
+    return np.array(K, float).reshape(-1, 4)
+
+
+def anh_nen_trung_vi(ds_anh):
+    """Ảnh nền của camera đứng yên = trung vị từng điểm ảnh qua nhiều khung (xe chạy qua bị loại)."""
+    ds = [a for a in ds_anh if a is not None]
+    if len(ds) < 3:
+        return None
+    return np.median(np.stack(ds), axis=0).astype(np.uint8)
+
+
 # ---------------------------------------------------------------- kết quả B trên một frame
 @dataclass
 class KetQuaFrame:
@@ -292,8 +328,12 @@ class HeThongCanhBao:
         m = self.mo_hinh_B
         return (m.predict_proba(Z)[:, 1] if hasattr(m, "predict_proba") else m.decision_function(Z)).astype(np.float32)
 
-    def quet_frame(self, img640, y_vach, he_so_co=1.0):
+    def quet_frame(self, img640, y_vach, he_so_co=1.0, nen=None):
         K = self.cua_so(y_vach, he_so_co=he_so_co)
+        if nen is not None:                      # thêm vùng chuyển động (web, camera đứng yên)
+            Km = vung_chuyen_dong(img640, nen, y_vach)
+            if len(Km):
+                K = np.vstack([K.reshape(-1, 4), Km])
         d = self.diem_xe(self.dac_trung_vung(img640, K)) if len(K) else np.zeros(0, np.float32)
         return KetQuaFrame(img640, float(y_vach), K, d)
 
@@ -387,9 +427,10 @@ class BoTheoDoi:
     Thêm: nối các cặp C ghép thành vết có ID (đầu ra 'ID và quỹ đạo' của C) và chỉ cảnh báo một lần cho mỗi ID (D3)."""
 
     def __init__(self, ht: HeThongCanhBao, y_vach, khung_den=None, che_do_den="auto", xe_di_len=True,
-                 nguong_xe=None, nguong_C=None, lam_muot=LAM_MUOT_A, he_so_co=1.0):
+                 nguong_xe=None, nguong_C=None, lam_muot=LAM_MUOT_A, he_so_co=1.0, nen=None):
         self.ht, self.y_vach, self.khung_den, self.che_do_den = ht, float(y_vach), khung_den, che_do_den
         self.he_so_co = float(he_so_co)
+        self.nen = nen
         self.xe_di_len = xe_di_len
         self.nguong_xe = ht.nguong_xe if nguong_xe is None else float(nguong_xe)
         self.nguong_C = ht.nguong_C if nguong_C is None else float(nguong_C)
@@ -416,7 +457,7 @@ class BoTheoDoi:
     def buoc(self, img640, t):
         """Xử lý một frame 640×640. Trả về dict kết quả của frame (khung xe, cặp C giữ, cảnh báo mới)."""
         trang_thai, xs = self.den(img640)
-        fr = self.ht.quet_frame(img640, self.y_vach, self.he_so_co)
+        fr = self.ht.quet_frame(img640, self.y_vach, self.he_so_co, self.nen)
         K_hien, d_hien, _, _ = self.ht.khung_xe(fr, self.nguong_xe)          # khung B hiển thị (ngưỡng B)
         K_vao, _, _, _ = self.ht.khung_xe(fr, self.ht.nguong_vao_C)          # ứng viên đưa vào C
         giu, canh_moi, vuot_ok = [], [], 0

@@ -471,7 +471,7 @@ class BoTheoDoi:
                     tid = self.next_id; self.next_id += 1
                     self.quy_dao[tid] = [(self.t_truoc, self._day(r["khung_a"]))]
                 if r["vuot_len"] and tid not in self.da_qua_vach:
-                    cu = self._xe_da_qua_vach(r["khung_a"], t)
+                    cu = self._xe_da_qua_vach(r["khung_a"], t, khung_2=r["khung_b"])
                     if cu is not None:
                         # C mất dấu rồi gán ID mới cho chính chiếc xe đã qua vạch (xe đứng đè lên vạch, khung rung
                         # qua lại): nối về ID cũ, không cảnh báo lần hai
@@ -494,14 +494,27 @@ class BoTheoDoi:
         return dict(t=t, den=trang_thai, xac_suat_den=xs, K=K_hien, d=d_hien, so_ung_vien=len(K_vao),
                     giu=giu, canh_bao=canh_moi, vuot_hop_le=vuot_ok, so_cua_so=len(fr.K))
 
-    def _xe_da_qua_vach(self, khung, t, giay=10.0, iou_min=0.5):
-        """ID của xe đã qua vạch trong `giay` giây gần đây mà khung lần cuối trùng (IoU ≥ iou_min) với khung này."""
-        tot, best = None, iou_min
+    def _xe_da_qua_vach(self, khung, t, giay=15.0, khung_2=None):
+        """ID của xe đã qua vạch trong `giay` giây gần đây và đang ở gần như cùng chỗ với khung này.
+
+        Cùng chỗ = hai khung chồng nhau (IoU ≥ 0,3) hoặc điểm giữa đáy lệch ngang ≤ nửa chiều rộng và lệch dọc ≤ nửa
+        chiều cao khung cũ (khung của cùng một xe có thể to nhỏ khác nhau giữa cửa sổ trượt và vùng chuyển động).
+        """
+        ds = [np.asarray(khung, float)] + ([np.asarray(khung_2, float)] if khung_2 is not None else [])
+        tot, best = None, None
         for tid, (t0, k0) in self.khung_cuoi.items():
-            if t - t0 <= giay:
-                iou = float(iou_ma_tran(np.asarray([k0], float), np.asarray([khung], float))[0, 0])
-                if iou >= best:
-                    tot, best = tid, iou
+            if t - t0 > giay:
+                continue
+            k0 = np.asarray(k0, float)
+            w0, h0 = k0[2] - k0[0], k0[3] - k0[1]
+            for k in ds:
+                iou = float(iou_ma_tran(k0[None], k[None])[0, 0])
+                dx = abs((k[0] + k[2]) / 2 - (k0[0] + k0[2]) / 2)
+                dy = abs(k[3] - k0[3])
+                if iou >= 0.3 or (dx <= 0.5 * w0 and dy <= 0.5 * h0):
+                    diem = iou - dx / max(w0, 1)
+                    if best is None or diem > best:
+                        tot, best = tid, diem
         return tot
 
     @staticmethod

@@ -1493,6 +1493,7 @@ with tab_real:
                 res["kind"] = "video" if input_type == "🎥 Video" else "image"
                 res["light_mode"] = cfg["light_mode"]
                 res["direction"] = cfg["direction"]
+                res["phien_ban_loi"] = PHIEN_BAN_LOI
                 st.session_state.analysis = res
                 now = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
                 src_name = source_key.split(":")[1] if source_key else ""
@@ -1508,8 +1509,11 @@ with tab_real:
 
         # ---------- Kết quả ----------
         res = st.session_state.analysis
+        if res is not None and res.get("phien_ban_loi") != PHIEN_BAN_LOI:
+            res = st.session_state.analysis = None        # kết quả của lõi cũ: bỏ, bắt chạy lại bằng lõi mới
         if res is not None and res.get("source") == source_key:
             step(4, "Kết quả", "")
+            st.caption(f"Kết quả này chạy bằng phiên bản lõi {res['phien_ban_loi']}.")
             n_v = len(res["violations"])
             st.markdown(f"""
             <div class="kpis">

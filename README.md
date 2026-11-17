@@ -1,6 +1,6 @@
 # Web giám sát vượt đèn đỏ · Nhóm 6
 
-Web chạy đúng ba mô hình đã huấn luyện trong notebook (file `mo_hinh/he_thong_canh_bao.joblib`):
+Web chạy đúng ba mô hình đã huấn luyện trong notebook (file `he_thong_canh_bao.joblib`):
 
 | Khối | Mô hình | Đầu vào |
 | --- | --- | --- |
@@ -12,16 +12,16 @@ Web chạy đúng ba mô hình đã huấn luyện trong notebook (file `mo_hinh
 ## Cấu trúc thư mục
 
 ```
-app.py                  giao diện Streamlit
-he_thong.py             lõi suy luận A → B → C (chép đúng code notebook, không phụ thuộc Streamlit)
-requirements.txt        scikit-learn==1.6.1 (cùng phiên bản đã lưu mô hình)
-.streamlit/config.toml
-mo_hinh/
-    he_thong_canh_bao.joblib   (trong ket_qua_mo_hinh.zip)
-    ket_qua_tong_hop.json      (số liệu tab "Hiệu năng mô hình")
-    video_mau_test.mp4         (video ghép từ frame test, notebook mục F1; nút "Video test của notebook")
-video_thu.mp4           (tuỳ chọn, video mẫu cũ)
+app.py                     giao diện Streamlit
+he_thong.py                lõi suy luận A → B → C (chép đúng code notebook)
+requirements.txt           scikit-learn==1.6.1 (cùng phiên bản đã lưu mô hình)
+he_thong_canh_bao.joblib   mô hình đã huấn luyện (notebook mục E)
+ket_qua_tong_hop.json      số liệu đánh giá (tab "Hiệu năng mô hình")
+video_mau_test.mp4         video ghép từ frame test (notebook mục F1)
+.streamlit/config.toml     giao diện tối, giới hạn tải lên 300 MB
 ```
+
+app.py tìm các file mô hình ở thư mục gốc hoặc trong `mo_hinh/`.
 
 Chạy: `pip install -r requirements.txt` rồi `streamlit run app.py`.
 

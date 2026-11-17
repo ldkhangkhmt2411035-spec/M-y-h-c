@@ -709,7 +709,13 @@ def light_box_rel(light_roi_pct):
 
 def predict_light(frame, light_roi_pct):
     """Mô hình A trên một khung hình: (trạng thái RED/YELLOW/GREEN, {lớp: xác suất})."""
-    lop, xs = HT.doan_den(to640(frame), light_box_rel(light_roi_pct))
+    img = to640(frame)
+    box = light_box_rel(light_roi_pct)
+    if hasattr(HT, "doan_den_chi_tiet"):
+        lop, xs, ct = HT.doan_den_chi_tiet(img, box)
+    else:
+        (lop, xs), ct = HT.doan_den(img, box), {}
+    st.session_state["light_detail"] = ct
     return {"red_light": "RED", "yellow_light": "YELLOW", "green_light": "GREEN"}.get(lop, "UNKNOWN"), xs
 
 
@@ -1393,8 +1399,16 @@ with tab_real:
                 elif light_ok:
                     ptxt = " · ".join(f"{STATE_VN[{'red_light': 'RED', 'yellow_light': 'YELLOW', 'green_light': 'GREEN'}[k]]} "
                                       f"{v:.2f}" for k, v in probs.items())
-                    z2.markdown(f"Mô hình A ({MODELS['A']['thuat_toan']}) &nbsp; {pill(prev_state)}<br>"
-                                f"<span style='color:{C_MUTED};font-size:.85rem'>Xác suất: {ptxt}</span>",
+                    ct_ = st.session_state.get("light_detail") or {}
+                    _vn = {"red_light": "đỏ", "yellow_light": "vàng", "green_light": "xanh"}
+                    ctxt = ""
+                    if ct_.get("A"):
+                        a_lop = max(ct_["A"], key=ct_["A"].get)
+                        ctxt = (f"<br><span style='color:{C_MUTED};font-size:.85rem'>Riêng mô hình A: {_vn[a_lop]} "
+                                f"{ct_['A'][a_lop]:.2f} · vị trí bóng sáng: "
+                                f"{_vn[ct_['vi_tri']] if ct_.get('vi_tri') else 'không dùng (hộp đèn không rõ 3 bóng)'}</span>")
+                    z2.markdown(f"Màu đèn &nbsp; {pill(prev_state)}<br>"
+                                f"<span style='color:{C_MUTED};font-size:.85rem'>Xác suất: {ptxt}</span>{ctxt}",
                                 unsafe_allow_html=True)
                 if z3.button("Thử B trên khung này", width="stretch",
                              help="Chạy mô hình B (SVM-RBF) trên khung xem trước, mất vài giây."):
@@ -1407,6 +1421,15 @@ with tab_real:
                     st.caption(f"Mô hình B tìm thấy {len(b_prev[1])} khung xe trong dải quét (khung xanh mảnh).")
 
         step(3, "Phân tích", "")
+        if direction == "up" and cfg["y_vach"] > 85:
+            banner("Vạch dừng đang sát mép dưới khung hình. Hệ thống chỉ báo vượt vạch khi thấy đáy xe <b>trước</b> vạch ở "
+                   "khung này và <b>sau</b> vạch ở khung kế tiếp; vạch sát mép thì xe chưa kịp hiện ra trước vạch nên không "
+                   "bao giờ được tính là vượt. Hãy đặt vạch đúng chỗ vạch sơn thật, chừa ít nhất khoảng 15% chiều cao bên dưới.",
+                   good="warn")
+        elif direction == "down" and cfg["y_vach"] < 15:
+            banner("Vạch dừng đang sát mép trên khung hình: xe đi từ trên xuống chưa kịp hiện ra trước vạch nên không thể "
+                   "tính là vượt. Hãy đặt vạch đúng chỗ vạch sơn thật, chừa ít nhất khoảng 15% chiều cao bên trên.",
+                   good="warn")
         st.caption("Lưu ý: ba mô hình chỉ học từ 4 camera của dataset (ảnh 640×640). Trên camera khác, kết quả kém đi rõ rệt: "
                    "notebook đo trên 60 ảnh ngoài 4 camera, B chỉ đạt F1 tìm xe 0,078; với đoạn video chưa thấy, A còn "
                    "macro F1 0,700. Chỉnh “Cỡ xe so với camera huấn luyện” và chọn đúng hộp đèn sẽ giúp phần nào, "

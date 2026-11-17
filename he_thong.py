@@ -132,7 +132,13 @@ def khung_bong_sang(img, khung, gian=0.25):
         nguong_v = max(110, int(0.7 * v[co_mau].max()))
         mask = (co_mau & (v >= nguong_v)).astype(np.uint8)
     if mask is None or mask.sum() < 4:
-        return khung
+        # bóng đèn cháy sáng thành trắng: chỉ nhận đốm trắng nằm giữa hộp đèn (tránh nền trời ở mép)
+        hh, ww = v.shape
+        trong = np.zeros_like(v, dtype=bool)
+        trong[int(0.1 * hh):int(0.9 * hh) + 1, int(0.15 * ww):int(0.85 * ww) + 1] = True
+        mask = ((v >= 235) & trong).astype(np.uint8)
+        if mask.sum() < 4:
+            return khung
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     n, nhan, tk, _ = cv2.connectedComponentsWithStats(mask, 8)
     if n <= 1:
@@ -145,6 +151,42 @@ def khung_bong_sang(img, khung, gian=0.25):
     bx0, by0 = max(0, x - dx), max(0, y - dy)
     bx1, by1 = min(vung.shape[1], x + w + dx), min(vung.shape[0], y + h + dy)
     return ((c0 + bx0) / W, (r0 + by0) / H, (c0 + bx1) / W, (r0 + by1) / H)
+
+
+def mau_theo_vi_tri(img, khung):
+    """Màu suy từ vị trí bóng đang sáng trong hộp đèn 3 bóng: dọc trên → đỏ, giữa → vàng, dưới → xanh;
+    ngang trái → đỏ, giữa → vàng, phải → xanh. Không chắc (hộp gần vuông, không thấy bóng, bóng nằm sát
+    ranh giới hai ô) thì trả về None."""
+    H, W = img.shape[:2]
+    x1, y1, x2, y2 = khung
+    hp, wp = (y2 - y1) * H, (x2 - x1) * W
+    b = khung_bong_sang(img, khung)
+    if tuple(round(float(v), 6) for v in b) == tuple(round(float(v), 6) for v in khung):
+        return None
+    cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    if hp >= 1.8 * wp:
+        t = (cy - y1) / max(y2 - y1, 1e-9)
+    elif wp >= 1.8 * hp:
+        t = (cx - x1) / max(x2 - x1, 1e-9)
+    else:
+        return None
+    if abs(t - 1 / 3) < 0.05 or abs(t - 2 / 3) < 0.05:
+        return None
+    lop = "red_light" if t < 1 / 3 else ("yellow_light" if t < 2 / 3 else "green_light")
+    # màu của bóng phải hợp với vị trí, nếu không thì khung người dùng chọn có thể không phải cả hộp đèn → bỏ qua
+    r0, r1 = int(b[1] * H), max(int(b[3] * H), int(b[1] * H) + 1)
+    c0, c1 = int(b[0] * W), max(int(b[2] * W), int(b[0] * W) + 1)
+    hsv = cv2.cvtColor(img[r0:r1, c0:c1], cv2.COLOR_BGR2HSV)
+    m = (hsv[..., 1] >= 90) & (hsv[..., 2] >= 110)
+    if m.sum() >= 3:
+        hue = float(np.median(hsv[..., 0][m]))
+        hop = {"red_light": hue <= 20 or hue >= 150, "yellow_light": 8 <= hue <= 40,
+               "green_light": 35 <= hue <= 100}[lop]
+        if not hop:
+            return None
+    elif max(hp, wp) < 2.2 * min(hp, wp):          # bóng cháy trắng, không có màu: chỉ tin vị trí khi chắc là hộp 3 bóng
+        return None
+    return lop
 
 
 # ---------------------------------------------------------------- kết quả B trên một frame
@@ -188,16 +230,34 @@ class HeThongCanhBao:
         tim_bong=True: trong khung hộp đèn người dùng chọn, tìm bóng đang sáng và chỉ đưa vùng bóng đó vào A
         (dữ liệu huấn luyện đèn xanh, đèn đỏ chủ yếu cắt sát bóng sáng; đưa cả hộp đèn tối vào thì A dễ đoán sai).
         """
+        lop, xs, _ = self.doan_den_chi_tiet(img, khung_den, tim_bong=tim_bong)
+        return lop, xs
+
+    def doan_den_chi_tiet(self, img, khung_den, tim_bong=True, ket_hop_vi_tri=True, trong_so_vi_tri=0.6):
+        """Như doan_den, kèm chi tiết: xác suất riêng của A và màu suy từ vị trí bóng sáng.
+
+        ket_hop_vi_tri=True (chỉ dùng trên web, notebook không có bước này): khi hộp đèn là loại 3 bóng và thấy rõ
+        bóng nào đang sáng, xác suất cuối = 0,4 × xác suất của A + 0,6 × màu theo vị trí bóng. Bóng màu cam/vàng
+        nằm sát ranh giới đỏ–vàng (H ≈ 10–15) hoặc màu xanh khác dữ liệu huấn luyện sẽ được vị trí bóng sửa lại.
+        """
         ds = [khung_den] if np.isscalar(khung_den[0]) else list(khung_den)
-        if tim_bong:
-            ds = [khung_bong_sang(img, k) for k in ds]
-        X = np.array([dac_trung_den_anh(img, k) for k in ds])
+        dung = [khung_bong_sang(img, k) for k in ds] if tim_bong else ds
+        X = np.array([dac_trung_den_anh(img, k) for k in dung])
         if self.ten_dac_trung_A:
             import pandas as pd
             X = pd.DataFrame(X, columns=self.ten_dac_trung_A)
-        p = self.mo_hinh_A.predict_proba(self.chuan_hoa_A.transform(X)).mean(0)
+        pA = self.mo_hinh_A.predict_proba(self.chuan_hoa_A.transform(X)).mean(0)
         lop = list(self.mo_hinh_A.classes_)
-        return lop[int(np.argmax(p))], dict(zip(lop, (float(x) for x in p)))
+        vi_tri = [mau_theo_vi_tri(img, k) for k in ds] if ket_hop_vi_tri else []
+        vi_tri = [v for v in vi_tri if v is not None and v in lop]
+        p = pA.copy()
+        if vi_tri:
+            mot = np.zeros(len(lop))
+            for v in vi_tri:
+                mot[lop.index(v)] += 1.0 / len(vi_tri)
+            p = (1 - trong_so_vi_tri) * pA + trong_so_vi_tri * mot
+        ct = {"A": dict(zip(lop, (float(x) for x in pA))), "vi_tri": vi_tri[0] if vi_tri else None}
+        return lop[int(np.argmax(p))], dict(zip(lop, (float(x) for x in p))), ct
 
     # ---------------- B
     def hog_sang_pca(self, Hm):

@@ -112,6 +112,41 @@ def dac_trung_den_anh(img, khung):
                            [((y2 - y1) * H) / max((x2 - x1) * W, 1e-6)]])
 
 
+def khung_bong_sang(img, khung, gian=0.25):
+    """Tìm bóng đèn đang sáng trong khung hộp đèn (x1, y1, x2, y2 tỉ lệ 0..1); trả về khung ôm sát bóng đó.
+
+    Không tìm thấy đốm sáng rõ thì trả lại khung cũ.
+    """
+    H, W = img.shape[:2]
+    x1, y1, x2, y2 = khung
+    c0, r0 = int(max(0, x1 * W)), int(max(0, y1 * H))
+    c1, r1 = int(min(W, max(x2 * W, c0 + 1))), int(min(H, max(y2 * H, r0 + 1)))
+    vung = img[r0:r1, c0:c1]
+    if vung.size == 0 or min(vung.shape[:2]) < 4:
+        return khung
+    hsv = cv2.cvtColor(vung, cv2.COLOR_BGR2HSV)
+    s, v = hsv[..., 1].astype(np.int32), hsv[..., 2].astype(np.int32)
+    co_mau = s >= 90
+    mask = None
+    if co_mau.sum() >= 4:                               # ưu tiên đốm có màu (bóng đèn), không lấy nền trời trắng
+        nguong_v = max(110, int(0.7 * v[co_mau].max()))
+        mask = (co_mau & (v >= nguong_v)).astype(np.uint8)
+    if mask is None or mask.sum() < 4:
+        return khung
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    n, nhan, tk, _ = cv2.connectedComponentsWithStats(mask, 8)
+    if n <= 1:
+        return khung
+    i = 1 + int(np.argmax(tk[1:, cv2.CC_STAT_AREA]))
+    x, y, w, h = tk[i, 0], tk[i, 1], tk[i, 2], tk[i, 3]
+    if w * h < 4:
+        return khung
+    dx, dy = gian * w, gian * h
+    bx0, by0 = max(0, x - dx), max(0, y - dy)
+    bx1, by1 = min(vung.shape[1], x + w + dx), min(vung.shape[0], y + h + dy)
+    return ((c0 + bx0) / W, (r0 + by0) / H, (c0 + bx1) / W, (r0 + by1) / H)
+
+
 # ---------------------------------------------------------------- kết quả B trên một frame
 @dataclass
 class KetQuaFrame:
@@ -147,9 +182,15 @@ class HeThongCanhBao:
         self.ten_dac_trung_A = list(getattr(self.chuan_hoa_A, "feature_names_in_", [])) or None
 
     # ---------------- A
-    def doan_den(self, img, khung_den):
-        """khung_den: một khung (x1, y1, x2, y2) tỉ lệ 0..1 hoặc danh sách khung. Trả về (lớp, {lớp: xác suất})."""
+    def doan_den(self, img, khung_den, tim_bong=True):
+        """khung_den: một khung (x1, y1, x2, y2) tỉ lệ 0..1 hoặc danh sách khung. Trả về (lớp, {lớp: xác suất}).
+
+        tim_bong=True: trong khung hộp đèn người dùng chọn, tìm bóng đang sáng và chỉ đưa vùng bóng đó vào A
+        (dữ liệu huấn luyện đèn xanh, đèn đỏ chủ yếu cắt sát bóng sáng; đưa cả hộp đèn tối vào thì A dễ đoán sai).
+        """
         ds = [khung_den] if np.isscalar(khung_den[0]) else list(khung_den)
+        if tim_bong:
+            ds = [khung_bong_sang(img, k) for k in ds]
         X = np.array([dac_trung_den_anh(img, k) for k in ds])
         if self.ten_dac_trung_A:
             import pandas as pd
@@ -172,11 +213,16 @@ class HeThongCanhBao:
                       for x1, y1, x2, y2 in K])
         return self.hog_sang_pca(np.vstack([hog_lo(P[i:i + 2000]) for i in range(0, len(P), 2000)]))
 
-    def cua_so(self, ly, buoc=BUOC_TRUOT):
-        """Cửa sổ trượt có đáy nằm trong dải của nó và trong vùng [vạch − 0,20; vạch + 0,15] (giống notebook)."""
+    def cua_so(self, ly, buoc=BUOC_TRUOT, he_so_co=1.0):
+        """Cửa sổ trượt có đáy nằm trong dải của nó và trong vùng [vạch − 0,20; vạch + 0,15] (giống notebook).
+
+        he_so_co: nhân cỡ cửa sổ khi xe trong camera mới to/nhỏ hơn camera huấn luyện (1 = đúng notebook).
+        Vùng ảnh luôn được thu về 64 × 64 trước khi tính HOG nên B vẫn nhận đầu vào cùng dạng.
+        """
         lo_r, hi_r = (ly + self.roi[0]) * S, (ly + self.roi[1]) * S
         K = []
         for lo, hi, w, h in self.kich_thuoc:
+            w, h = min(S, max(8, int(round(w * he_so_co)))), min(S, max(8, int(round(h * he_so_co))))
             for yb in range(int(max(lo * S, lo_r, h)), int(min(hi * S, hi_r, S)) + 1, max(int(h * buoc), 4)):
                 for x in range(0, S - w + 1, max(int(w * buoc), 4)):
                     K.append((x, yb - h, x + w, yb))
@@ -186,8 +232,8 @@ class HeThongCanhBao:
         m = self.mo_hinh_B
         return (m.predict_proba(Z)[:, 1] if hasattr(m, "predict_proba") else m.decision_function(Z)).astype(np.float32)
 
-    def quet_frame(self, img640, y_vach):
-        K = self.cua_so(y_vach)
+    def quet_frame(self, img640, y_vach, he_so_co=1.0):
+        K = self.cua_so(y_vach, he_so_co=he_so_co)
         d = self.diem_xe(self.dac_trung_vung(img640, K)) if len(K) else np.zeros(0, np.float32)
         return KetQuaFrame(img640, float(y_vach), K, d)
 
@@ -281,8 +327,9 @@ class BoTheoDoi:
     Thêm: nối các cặp C ghép thành vết có ID (đầu ra 'ID và quỹ đạo' của C) và chỉ cảnh báo một lần cho mỗi ID (D3)."""
 
     def __init__(self, ht: HeThongCanhBao, y_vach, khung_den=None, che_do_den="auto", xe_di_len=True,
-                 nguong_xe=None, nguong_C=None, lam_muot=LAM_MUOT_A):
+                 nguong_xe=None, nguong_C=None, lam_muot=LAM_MUOT_A, he_so_co=1.0):
         self.ht, self.y_vach, self.khung_den, self.che_do_den = ht, float(y_vach), khung_den, che_do_den
+        self.he_so_co = float(he_so_co)
         self.xe_di_len = xe_di_len
         self.nguong_xe = ht.nguong_xe if nguong_xe is None else float(nguong_xe)
         self.nguong_C = ht.nguong_C if nguong_C is None else float(nguong_C)
@@ -309,7 +356,7 @@ class BoTheoDoi:
     def buoc(self, img640, t):
         """Xử lý một frame 640×640. Trả về dict kết quả của frame (khung xe, cặp C giữ, cảnh báo mới)."""
         trang_thai, xs = self.den(img640)
-        fr = self.ht.quet_frame(img640, self.y_vach)
+        fr = self.ht.quet_frame(img640, self.y_vach, self.he_so_co)
         K_hien, d_hien, _, _ = self.ht.khung_xe(fr, self.nguong_xe)          # khung B hiển thị (ngưỡng B)
         K_vao, _, _, _ = self.ht.khung_xe(fr, self.ht.nguong_vao_C)          # ứng viên đưa vào C
         giu, canh_moi, vuot_ok = [], [], 0

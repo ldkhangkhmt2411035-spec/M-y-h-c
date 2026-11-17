@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import tempfile
@@ -12,7 +13,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from skimage.feature import hog
 
-from he_thong import (BoTheoDoi, HeThongCanhBao, TEN_NHOM_DEN, dac_trung_den_anh, hog_lo)
+from he_thong import (BoTheoDoi, HeThongCanhBao, TEN_NHOM_DEN, dac_trung_den_anh, hog_lo, khung_bong_sang)
 
 try:  # cho phép bấm chuột lên ảnh để chọn đèn / vạch dừng
     from streamlit_image_coordinates import streamlit_image_coordinates as image_picker
@@ -21,6 +22,9 @@ except ImportError:
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(APP_DIR, "mo_hinh")
+
+
+DEN_MAU_B64 = "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"
 
 
 def _khoa_ten(ten):
@@ -725,6 +729,10 @@ def draw_result(frame, cfg, r, info_text, tracks_bottom=None):
     if cfg["light_mode"] == "auto":
         x0, y0, x1, y1 = pct_rect_to_px(cfg["light_roi"], img.shape)
         cv2.rectangle(img, (x0, y0), (x1, y1), STATE_COLOR[state], 2)
+        # bóng đèn đang sáng mà mô hình A thực sự đọc (khung trắng mảnh)
+        bx = khung_bong_sang(frame, light_box_rel(cfg["light_roi"]))
+        Hf, Wf = frame.shape[:2]
+        cv2.rectangle(img, (int(bx[0] * Wf), int(bx[1] * Hf)), (int(bx[2] * Wf), int(bx[3] * Hf)), (255, 255, 255), 1)
         lbl = f"A: {STATE_ASCII[state]}"
         (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
         ty = y0 - 6 if y0 - 6 >= th + 32 else y1 + th + 6
@@ -762,7 +770,8 @@ def analyze_sequence(frames, cfg, total, progress=None, writer=None):
     bt = BoTheoDoi(HT, cfg["y_vach"] / 100,
                    light_box_rel(cfg["light_roi"]) if cfg["light_mode"] == "auto" else None,
                    che_do_den=cfg["light_mode"], xe_di_len=cfg["direction"] == "up",
-                   nguong_xe=cfg["nguong_xe"], nguong_C=cfg["nguong_C"], lam_muot=cfg["lam_muot"])
+                   nguong_xe=cfg["nguong_xe"], nguong_C=cfg["nguong_C"], lam_muot=cfg["lam_muot"],
+                   he_so_co=cfg.get("he_so_co", 1.0))
     res = dict(violations=[], timeline=[], annotated=[], n_frames=0, crossed_ok=0, light_samples={},
                light_sample=None, vehicle_sample=None, n_boxes=0, n_windows=0, t_model=0.0, p_light=[])
     viol_ids = set()
@@ -1022,6 +1031,12 @@ suất hai khung là cùng một xe. Cặp có xác suất ≥ ngưỡng mới �
 - Giảm ngưỡng: ghép được nhiều hơn, nhưng dễ ghép nhầm hai xe khác nhau và báo nhầm.
 - {HT.nguong_C:g} là ngưỡng cho F1 vượt vạch cao nhất khi dự đoán ngoài fold trên train (không dùng test để chọn).
 
+**Mô hình A đọc bóng nào.** Bạn chọn cả hộp đèn; web tự tìm bóng đang sáng trong hộp (khung trắng mảnh trên hình) và chỉ
+đưa vùng bóng đó vào A, vì ảnh đèn xanh, đèn đỏ trong dữ liệu huấn luyện chủ yếu cắt sát bóng sáng.
+
+**Cỡ xe so với camera huấn luyện.** B quét cửa sổ có cỡ cố định theo 4 camera của dataset. Camera gần hoặc zoom thì xe to
+hơn cửa sổ, B chỉ ôm được một phần xe; khi đó tăng hệ số (1,5–2) và bấm “Thử B trên khung này” để kiểm tra.
+
 **Làm mượt màu đèn = 3 frame.** Mô hình A đoán màu đèn ở từng frame. Màu dùng để kết luận là màu xuất hiện nhiều nhất
 trong 3 frame gần nhất, để một frame đoán sai (đèn lóa, bị che) không biến đèn xanh thành đỏ hay ngược lại.
 
@@ -1258,6 +1273,11 @@ with tab_real:
                 light_mode = st.selectbox("Trạng thái đèn", list(light_options), format_func=light_options.get,
                                           key="light_mode")
 
+            he_so_co = st.select_slider(
+                "Cỡ xe so với camera huấn luyện", [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0], value=1.0, key="he_so_co",
+                help="Mô hình B quét cửa sổ có cỡ cố định theo camera trong dataset. Nếu xe trong video của bạn to hơn "
+                     "(camera gần, zoom) thì tăng lên, nhỏ hơn thì giảm. Bấm “Thử B trên khung này” để xem khung xe có ôm "
+                     "vừa xe không. 1,0 = đúng như notebook.")
             with st.expander("Chỉnh chi tiết bằng thanh trượt"):
                 ly = st.slider("Vạch dừng · vị trí dọc (% chiều cao)", 0, 100, key="ly")
                 st.caption("Vùng đèn (% khung hình)")
@@ -1279,6 +1299,7 @@ with tab_real:
 
         cfg = dict(y_vach=float(ly), direction=direction, light_roi=(rx, ry, rw, rh), light_mode=light_mode,
                    nguong_xe=nguong_xe, nguong_C=nguong_C, lam_muot=lam_muot, buoc_giay=float(buoc_giay),
+                   he_so_co=float(he_so_co),
                    max_frames=int(max_frames))
 
         if (st.session_state.get("sample_confirmed") and source_key
@@ -1300,7 +1321,7 @@ with tab_real:
                 prev_state = "RED" if light_mode == "red" else "GREEN"
             fake = dict(den=prev_state, K=np.zeros((0, 4)), giu=[], canh_bao=[])
             b_prev = st.session_state.get("b_preview")
-            if b_prev and b_prev[0] == (source_key, cfg["y_vach"], nguong_xe):
+            if b_prev and b_prev[0] == (source_key, cfg["y_vach"], nguong_xe, cfg["he_so_co"]):
                 fake["K"] = b_prev[1]
             hint = "Xem truoc" if light_ok else "BAM VAO DEN GIAO THONG DE CHON DEN"
             cfg_prev = dict(cfg, light_mode=light_mode if light_ok else "none")
@@ -1372,16 +1393,18 @@ with tab_real:
                 if z3.button("Thử B trên khung này", width="stretch",
                              help="Chạy mô hình B (SVM-RBF) trên khung xem trước, mất vài giây."):
                     with st.spinner("Mô hình B đang quét cửa sổ trượt..."):
-                        fr_ = HT.quet_frame(to640(preview), cfg["y_vach"] / 100)
+                        fr_ = HT.quet_frame(to640(preview), cfg["y_vach"] / 100, cfg["he_so_co"])
                         Kb_, _, _, _ = HT.khung_xe(fr_, nguong_xe)
-                    st.session_state.b_preview = ((source_key, cfg["y_vach"], nguong_xe), Kb_)
+                    st.session_state.b_preview = ((source_key, cfg["y_vach"], nguong_xe, cfg["he_so_co"]), Kb_)
                     st.rerun()
-                if b_prev and b_prev[0] == (source_key, cfg["y_vach"], nguong_xe):
+                if b_prev and b_prev[0] == (source_key, cfg["y_vach"], nguong_xe, cfg["he_so_co"]):
                     st.caption(f"Mô hình B tìm thấy {len(b_prev[1])} khung xe trong dải quét (khung xanh mảnh).")
 
         step(3, "Phân tích", "")
-        st.caption("Lưu ý: mô hình B học từ 4 camera của dataset (ảnh 640×640, cỡ xe theo dải). Trên camera khác, "
-                   "nhất là góc nhìn hay cỡ xe khác hẳn, B sẽ bỏ sót nhiều hơn (notebook mục G).")
+        st.caption("Lưu ý: ba mô hình chỉ học từ 4 camera của dataset (ảnh 640×640). Trên camera khác, kết quả kém đi rõ rệt: "
+                   "notebook đo trên 60 ảnh ngoài 4 camera, B chỉ đạt F1 tìm xe 0,078; với đoạn video chưa thấy, A còn "
+                   "macro F1 0,700. Chỉnh “Cỡ xe so với camera huấn luyện” và chọn đúng hộp đèn sẽ giúp phần nào, "
+                   "nhưng muốn chạy tốt trên camera mới cần thêm dữ liệu của camera đó để huấn luyện lại.")
         can_run = light_ok and not (input_type == "🖼️ Ảnh" and not images)
         if not light_ok:
             st.caption("Nút phân tích sẽ mở khi bạn đã chọn đèn ở Bước 2.")
@@ -1616,10 +1639,8 @@ with tab_feat:
         with st.container(border=True):
             st.markdown("**Mô hình A · 44 đặc trưng màu của vùng đèn**")
             if light_sample is None:
-                light_sample = np.full((90, 40, 3), 20, dtype=np.uint8)
-                cv2.circle(light_sample, (20, 18), 11, (0, 0, 235), -1)
-                cv2.circle(light_sample, (20, 45), 11, (0, 40, 50), -1)
-                cv2.circle(light_sample, (20, 72), 11, (0, 50, 0), -1)
+                # vùng đèn đỏ thật lấy từ dataset (ảnh vẽ tay màu thuần không giống dữ liệu huấn luyện)
+                light_sample = cv2.imdecode(np.frombuffer(base64.b64decode(DEN_MAU_B64), np.uint8), cv2.IMREAD_COLOR)
             feat = dac_trung_den_anh(light_sample, (0.0, 0.0, 1.0, 1.0))
             lop, xs = HT.doan_den(light_sample, (0.0, 0.0, 1.0, 1.0))
             st_ = {"red_light": "RED", "yellow_light": "YELLOW", "green_light": "GREEN"}.get(lop, "UNKNOWN")

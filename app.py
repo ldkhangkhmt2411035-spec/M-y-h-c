@@ -13,7 +13,13 @@ import plotly.graph_objects as go
 import streamlit as st
 from skimage.feature import hog
 
-from he_thong import (BoTheoDoi, HeThongCanhBao, TEN_NHOM_DEN, dac_trung_den_anh, hog_lo, khung_bong_sang)
+from he_thong import (BoTheoDoi, HeThongCanhBao, TEN_NHOM_DEN, dac_trung_den_anh, hog_lo)
+
+try:  # he_thong.py bản mới có hàm này; nếu repo còn he_thong.py cũ thì web vẫn chạy (chỉ không vẽ khung bóng đèn)
+    from he_thong import khung_bong_sang
+except ImportError:
+    def khung_bong_sang(img, khung, gian=0.25):
+        return khung
 
 try:  # cho phép bấm chuột lên ảnh để chọn đèn / vạch dừng
     from streamlit_image_coordinates import streamlit_image_coordinates as image_picker

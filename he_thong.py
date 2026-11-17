@@ -441,6 +441,7 @@ class BoTheoDoi:
         self.lich_su_den = []
         self.da_qua_vach = set()
         self.quy_dao = {}           # ID → danh sách (thời điểm, điểm đáy khung px 640)
+        self.khung_cuoi = {}        # ID đã qua vạch → (thời điểm thấy lần cuối, khung px 640)
 
     def den(self, img640):
         if self.che_do_den == "red":
@@ -469,10 +470,22 @@ class BoTheoDoi:
                 if tid is None:
                     tid = self.next_id; self.next_id += 1
                     self.quy_dao[tid] = [(self.t_truoc, self._day(r["khung_a"]))]
+                if r["vuot_len"] and tid not in self.da_qua_vach:
+                    cu = self._xe_da_qua_vach(r["khung_a"], t)
+                    if cu is not None:
+                        # C mất dấu rồi gán ID mới cho chính chiếc xe đã qua vạch (xe đứng đè lên vạch, khung rung
+                        # qua lại): nối về ID cũ, không cảnh báo lần hai
+                        if tid == self.next_id - 1 and len(self.quy_dao.get(tid, [])) <= 1:
+                            self.quy_dao.pop(tid, None)
+                            self.next_id -= 1
+                        tid = cu
                 id_nay[r["j"]] = tid; r["id"] = tid
                 self.quy_dao.setdefault(tid, []).append((t, self._day(r["khung_b"])))
+                if tid in self.khung_cuoi:
+                    self.khung_cuoi[tid] = (t, r["khung_b"])
                 if r["vuot_len"] and tid not in self.da_qua_vach:
                     self.da_qua_vach.add(tid)                    # D3: mỗi xe (ID) chỉ xét một lần
+                    self.khung_cuoi[tid] = (t, r["khung_b"])
                     if trang_thai == "RED":
                         canh_moi.append(r)
                     else:
@@ -480,6 +493,16 @@ class BoTheoDoi:
         self.id_truoc, self.truoc, self.t_truoc = id_nay, fr, t
         return dict(t=t, den=trang_thai, xac_suat_den=xs, K=K_hien, d=d_hien, so_ung_vien=len(K_vao),
                     giu=giu, canh_bao=canh_moi, vuot_hop_le=vuot_ok, so_cua_so=len(fr.K))
+
+    def _xe_da_qua_vach(self, khung, t, giay=10.0, iou_min=0.5):
+        """ID của xe đã qua vạch trong `giay` giây gần đây mà khung lần cuối trùng (IoU ≥ iou_min) với khung này."""
+        tot, best = None, iou_min
+        for tid, (t0, k0) in self.khung_cuoi.items():
+            if t - t0 <= giay:
+                iou = float(iou_ma_tran(np.asarray([k0], float), np.asarray([khung], float))[0, 0])
+                if iou >= best:
+                    tot, best = tid, iou
+        return tot
 
     @staticmethod
     def _day(k):

@@ -894,7 +894,9 @@ def analyze_video(video_path, cfg, progress, start=0.0, end=None, box=None):
     if cfg.get("tru_nen", True):
         # ảnh nền của camera = trung vị 25 khung rải đều trên đoạn được xét (xe chạy qua bị loại)
         mau = []
-        for fi in np.linspace(wanted[0], wanted[-1], num=min(25, max(3, len(wanted)))).astype(int):
+        # lấy rải trên cả video (không chỉ đoạn được xét) để xe đứng chờ đèn lâu ít bị lẫn vào nền
+        lo_f, hi_f = (0, n_total - 1) if n_total > len(wanted) else (wanted[0], wanted[-1])
+        for fi in np.linspace(lo_f, hi_f, num=min(40, max(3, n_total or len(wanted)))).astype(int):
             cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
             ok_, f_ = cap.read()
             if ok_:
